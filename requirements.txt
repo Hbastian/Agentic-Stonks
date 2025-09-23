@@ -1,0 +1,16 @@
+# run pip install -r requirements.txt or python -m pip install -r requirements or python3 -m pip install -r requirements to get the following
+
+# Web framework
+flask>=3.0.3
+
+# UI framework
+gradio>=5.46.1
+
+# yfinance for stock info
+yfinance>=0.2.40
+pandas>=2.2.2
+
+# display
+plotly>=5.24.1
+
+
