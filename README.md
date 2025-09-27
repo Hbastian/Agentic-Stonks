@@ -11,9 +11,9 @@ This template shows how to:
 - Python **3.10+** recommended
 - An **OpenAI API key** (from https://platform.openai.com/)
 
-## Quick Start (Terminal)
+## Quick Start In A Virtual Environment (Terminal) For Testing Purposes Only. Changes in here will not do anything
 ```bash
-python -m venv .venv
+python(version) -m venv .venv
 source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env           # then put your real key in .env
