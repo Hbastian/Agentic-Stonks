@@ -1,37 +1,48 @@
-# One-shot setup, run, and clean exit for Agentic-Stonks (Windows)
+# run.ps1
+# One-shot setup, run, and clean exit for Agentic-Stonks (Windows PowerShell)
 
-# Exit immediately if a command fails
 $ErrorActionPreference = "Stop"
 
-# Check if .venv folder exists, if not create it
-if (-Not (Test-Path ".venv")) {
+# Path to venv
+$venvPath = ".venv"
+
+# Create venv if it doesn't exist
+if (-Not (Test-Path $venvPath)) {
     Write-Output "Creating virtual environment..."
-    python -m venv .venv
+    python -m venv $venvPath
 }
 
-# Activate the virtual environment
+# Activate venv
 Write-Output "Activating virtual environment..."
-# This loads the activation script for PowerShell
-. .\.venv\Scripts\Activate.ps1
+& "$venvPath\Scripts\Activate.ps1"
 
 # Upgrade pip quietly
-Write-Output "Upgrading pip..."
-python -m pip install --upgrade pip | Out-Null
+python -m pip install --upgrade pip -q
 
-# Compute hash of requirements.txt
-$reqFile = "requirements.txt"
-$hashFile = ".venv\.requirements_hash"
+# Hash requirements.txt to detect changes
+$reqHashFile = "$venvPath\.requirements_hash"
+$newHash = (Get-FileHash requirements.txt -Algorithm MD5).Hash
 
-if (Test-Path $reqFile) {
-    $newHash = Get-FileHash $reqFile -Algorithm MD5 | Select-Object -ExpandProperty Hash
+if (-Not (Test-Path $reqHashFile) -or (Get-Content $reqHashFile) -ne $newHash) {
+    Write-Output "Installing/updating requirements..."
+    python -m pip install -r requirements.txt
+    $newHash | Out-File $reqHashFile -Encoding ASCII
+} else {
+    Write-Output "Requirements are up to date. Skipping reinstall."
+}
 
-    if (-Not (Test-Path $hashFile) -or (Get-Content $hashFile) -ne $newHash) {
-        Write-Output "Installing/updating requirements..."
-        python -m pip install -r requirements.txt
-        $newHash | Out-File $hashFile -Encoding ascii
-    }
-    else {
-        Write-Output "Requirements are up to date. Skipping reinstall."
+# Load .env if present
+if (Test-Path ".env") {
+    Write-Output "Loading environment variables from .env..."
+    Get-Content .env | ForEach-Object {
+        if ($_ -match "^\s*#") { return } # skip comments
+        if ($_ -match "^\s*$") { return } # skip empty lines
+        $parts = $_ -split '=', 2
+        if ($parts.Count -eq 2) {
+            $key = $parts[0].Trim()
+            $val = $parts[1].Trim()
+            $env:$key = $val
+        }
     }
 }
 
@@ -39,7 +50,6 @@ if (Test-Path $reqFile) {
 Write-Output "Starting Flask + Gradio app..."
 python app.py
 
-# Deactivate venv when done
+# Deactivate venv
 Write-Output "Deactivating virtual environment..."
 deactivate
-
