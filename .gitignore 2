@@ -1,0 +1,9 @@
+# API keys and secrets
+.env
+.env.*
+.venv/
+*.key
+*.pem
+apikey.txt
+config.properties
+secrets.json

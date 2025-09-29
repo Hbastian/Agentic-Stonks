@@ -28,6 +28,13 @@ else
     echo "Requirements are up to date. Skipping reinstall."
 fi
 
+# Load .env if present
+if [ -f ".env" ]; then
+    echo "Loading environment variables from .env..."
+    # export each line in .env into the environment
+    export $(grep -v '^#' .env | xargs)
+fi
+
 # Run the app
 echo "Starting Flask + Gradio app..."
 python app.py
