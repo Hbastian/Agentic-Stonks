@@ -1,13 +1,19 @@
+
 import gradio as gr
 import yfinance as yf
 import plotly.graph_objects as go
 import datetime
-from openai import OpenAI
 import os
 from typing import Dict, Tuple, Any
+from openai import OpenAI
+#import the following if running locally, otehrwise comment out
+from dotenv import load_dotenv
+
+#use if key is stored locally
+load_dotenv()
 
 # ---------- OpenAI setup ----------
-OpenAI.api_key = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # ---------- Allowed periods per interval ----------
 ALLOWED_PERIODS: Dict[str, Tuple[str, ...]] = {
