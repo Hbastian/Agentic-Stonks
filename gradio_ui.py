@@ -101,14 +101,20 @@ def get_stock_info(ticker: str, interval: str, period_choice: str, show_ma: bool
 # ---------- Chatbot ----------
 def stock_chat(message, history):
     try:
+        messages = [{"role": "system",
+                     "content": "You are a helpful financial assistant. Answer questions about stocks clearly."}]
+
+        # Flatten chat history safely
+        for user, bot in history:
+            messages.append({"role": "user", "content": user})
+            messages.append({"role": "assistant", "content": bot})
+
+        # Add new user message
+        messages.append({"role": "user", "content": message})
+
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a helpful financial assistant. Answer questions about stocks clearly."},
-                *[{"role": "user", "content": msg} if i % 2 == 0 else {"role": "assistant", "content": msg}
-                  for i, msg in enumerate(sum(history, ()))],
-                {"role": "user", "content": message}
-            ]
+            messages=messages
         )
         return resp.choices[0].message.content
     except Exception as e:
