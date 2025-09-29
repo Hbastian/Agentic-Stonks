@@ -20,7 +20,7 @@ def home():
 # Function to launch Gradio in a background thread
 def launch_gradio():
     demo = build_ui()
-    demo.launch(server_name="127.0.0.1", server_port=7860)
+    demo.launch(server_name="127.0.0.1", server_port=7861)
 
 # Main entry point
 if __name__ == "__main__":
