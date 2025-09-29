@@ -7,3 +7,5 @@
 apikey.txt
 config.properties
 secrets.json
+__pycache__/
+*.pyc
