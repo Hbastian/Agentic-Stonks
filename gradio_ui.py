@@ -8,7 +8,7 @@ from typing import Dict, Any
 from openai import OpenAI
 from dotenv import load_dotenv
 
-# Load env for local dev
+# 🔹 Load env for local dev
 load_dotenv()
 
 # ---------- OpenAI setup ----------
@@ -55,9 +55,8 @@ def _build_chart(hist, show_ma: bool, show_volume: bool, title: str):
     )
     return fig
 
-# ---------- Formatter for summary ----------
+# ---------- Helper: Format large numbers ----------
 def _format_number(val):
-    """Format large numbers into human-friendly strings (e.g., 1.2B)."""
     if val is None or (isinstance(val, float) and math.isnan(val)):
         return "N/A"
     try:
@@ -75,8 +74,46 @@ def _format_number(val):
     except Exception:
         return str(val)
 
+# ---------- Technical Indicators ----------
+def analyze_rsi(hist):
+    delta = hist["Close"].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss.replace(0, 1)
+    rsi = 100 - (100 / (1 + rs))
+    latest = rsi.iloc[-1]
+    if latest > 70:
+        verdict = "Overbought"
+    elif latest < 30:
+        verdict = "Oversold"
+    else:
+        verdict = "Neutral"
+    return f"RSI: {latest:.2f} ({verdict})"
+
+def analyze_ema(hist):
+    ema20 = hist["Close"].ewm(span=20, adjust=False).mean()
+    ema50 = hist["Close"].ewm(span=50, adjust=False).mean()
+    latest20, latest50 = ema20.iloc[-1], ema50.iloc[-1]
+    if latest20 > latest50:
+        verdict = "Bullish (EMA20 above EMA50)"
+    else:
+        verdict = "Bearish (EMA20 below EMA50)"
+    return f"EMA: 20-day={latest20:.2f}, 50-day={latest50:.2f} → {verdict}"
+
+def analyze_macd(hist):
+    ema12 = hist["Close"].ewm(span=12, adjust=False).mean()
+    ema26 = hist["Close"].ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    signal = macd.ewm(span=9, adjust=False).mean()
+    latest_macd, latest_signal = macd.iloc[-1], signal.iloc[-1]
+    if latest_macd > latest_signal:
+        verdict = "Bullish (MACD above Signal)"
+    else:
+        verdict = "Bearish (MACD below Signal)"
+    return f"MACD: {latest_macd:.2f} vs Signal={latest_signal:.2f} → {verdict}"
+
 # ---------- Summary builder ----------
-def _build_summary(info, ticker: str):
+def _build_summary(info, ticker: str, hist):
     return (
         f"### {info.get('shortName', ticker)} ({ticker.upper()})\n\n"
         f"💰 **Current Price:** {info.get('currentPrice', 'N/A')}\n"
@@ -84,16 +121,15 @@ def _build_summary(info, ticker: str):
         f"🏦 **Market Cap:** {_format_number(info.get('marketCap'))}\n"
         f"📊 **Volume:** {_format_number(info.get('volume'))}\n\n"
         f"📈 **52W High:** {info.get('fiftyTwoWeekHigh', 'N/A')}\n"
-        f"📉 **52W Low:** {info.get('fiftyTwoWeekLow', 'N/A')}\n"
+        f"📉 **52W Low:** {info.get('fiftyTwoWeekLow', 'N/A')}\n\n"
+        f"📊 **Indicators:**\n"
+        f"- {analyze_rsi(hist)}\n"
+        f"- {analyze_ema(hist)}\n"
+        f"- {analyze_macd(hist)}\n"
     )
 
 # ---------- Interval chooser ----------
 def _choose_interval(view_choice: str, period_choice: str) -> str:
-    """
-    Pick a safe interval for Yahoo Finance:
-    - If period is 1y, 2y, or 3y → use daily candles (1d)
-    - Else → follow the view mapping (Daily=1h, Weekly=1d)
-    """
     if period_choice in ["1y", "2y", "3y"]:
         return "1d"
     return VIEW_INTERVALS.get(view_choice, "1d")
@@ -119,11 +155,10 @@ def get_stock_info(ticker: str, view_choice: str, period_choice: str,
 
         current_last_ts = hist.index[-1]
         if cached["last_ts"] is not None and current_last_ts == cached["last_ts"]:
-            # No new data point → keep existing components
             return gr.update(), gr.update(), cached["updated"]
 
         info = stock.info
-        summary = _build_summary(info, ticker)
+        summary = _build_summary(info, ticker, hist)
 
         title = f"{ticker.upper()} — {view_choice} view over {effective_period} (interval={interval})"
         fig = _build_chart(hist, show_ma, show_volume, title)
@@ -134,22 +169,6 @@ def get_stock_info(ticker: str, view_choice: str, period_choice: str,
         return summary, fig, updated
     except Exception:
         return cached["summary"], cached["fig"], cached["updated"]
-
-# ---------- Top-of-hour timer callback ----------
-def _maybe_top_of_hour_refresh(drop_val, text_val, view_choice, period_choice, show_ma, show_volume):
-    """Refresh exactly once per hour at minute==00, else no-op."""
-    global _last_top_hour_key
-    now = datetime.datetime.now()
-    top_key = (now.year, now.month, now.day, now.hour)
-
-    if now.minute == 0:
-        if _last_top_hour_key != top_key:
-            _last_top_hour_key = top_key
-            ticker = text_val.strip().upper() if text_val.strip() else drop_val
-            return get_stock_info(ticker, view_choice, period_choice, show_ma, show_volume)
-
-    # No changes → keep current UI
-    return gr.update(), gr.update(), gr.update()
 
 # ---------- Chatbot ----------
 def stock_chat(message, history):
@@ -171,11 +190,11 @@ def stock_chat(message, history):
 
 # ---------- UI Builder ----------
 def build_ui():
-    with gr.Blocks(title="Stock Viewer + Chat") as demo:
+    with gr.Blocks(title="AgenticStonks Dashboard") as demo:
         gr.Markdown("# 📈 AgenticStonks Dashboard")
 
         with gr.Row():
-            # ----- LEFT: Stock Viewer -----
+            # LEFT: Stock Viewer + Indicators
             with gr.Column(scale=2):
                 with gr.Row():
                     ticker_dropdown = gr.Dropdown(
@@ -189,31 +208,17 @@ def build_ui():
                         value="",
                     )
 
-                view_choice = gr.Radio(
-                    label="View Type",
-                    choices=["Daily", "Weekly"],
-                    value="Daily"
-                )
-
-                period_choice = gr.Radio(
-                    label="Time Frame",
-                    choices=ALLOWED_PERIODS,
-                    value="6mo"
-                )
-
+                view_choice = gr.Radio(label="View Type", choices=["Daily", "Weekly"], value="Daily")
+                period_choice = gr.Radio(label="Time Frame", choices=ALLOWED_PERIODS, value="6mo")
                 show_ma = gr.Checkbox(label="Show MA-20 / MA-50", value=True)
                 show_volume = gr.Checkbox(label="Show Volume Bars", value=True)
 
-                # 🔹 Preload AAPL so the app isn't blank on open
-                default_summary, default_chart, default_updated = get_stock_info(
-                    "AAPL", "Daily", "6mo", True, True
-                )
-
+                # preload
+                default_summary, default_chart, default_updated = get_stock_info("AAPL", "Daily", "6mo", True, True)
                 stock_output = gr.Markdown(value=default_summary)
                 stock_chart = gr.Plot(value=default_chart)
                 last_updated = gr.Markdown(value=default_updated)
 
-                # --- Refresh on user changes ---
                 def _inputs_for(fn):
                     return dict(
                         fn=fn,
@@ -229,20 +234,18 @@ def build_ui():
                     inputs=[ticker_textbox, view_choice, period_choice, show_ma, show_volume],
                     outputs=[stock_output, stock_chart, last_updated]
                 )
-
                 view_choice.change(**_inputs_for(get_stock_info))
                 period_choice.change(**_inputs_for(get_stock_info))
                 show_ma.change(**_inputs_for(get_stock_info))
                 show_volume.change(**_inputs_for(get_stock_info))
 
-                # --- Top-of-hour auto refresh ---
                 gr.Timer(30.0).tick(
-                    fn=_maybe_top_of_hour_refresh,
+                    fn=lambda *a: get_stock_info(*a),
                     inputs=[ticker_dropdown, ticker_textbox, view_choice, period_choice, show_ma, show_volume],
                     outputs=[stock_output, stock_chart, last_updated]
                 )
 
-            # ----- RIGHT: Chatbox -----
+            # RIGHT: Chatbox
             with gr.Column(scale=1):
                 gr.ChatInterface(
                     fn=stock_chat,
@@ -250,5 +253,9 @@ def build_ui():
                     title="💬 Stonk Assistant",
                     description="Ask me questions about stocks while watching the chart!"
                 )
-
     return demo
+
+# ---------- Entry Point ----------
+if __name__ == "__main__":
+    demo = build_ui()
+    demo.launch(server_name="127.0.0.1", server_port=7860)
