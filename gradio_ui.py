@@ -8,6 +8,31 @@ from typing import Dict, Tuple, Any
 from openai import OpenAI
 #import the following if running locally, otehrwise comment out
 from dotenv import load_dotenv
+from analysis import analyze_rsi, analyze_ema, analyze_macd
+import gradio as gr
+
+# ----- Data analysis -----
+def stock_advisor(stock_symbol):
+    rsi_result, _ = analyze_rsi(stock_symbol)
+    ema_result, _ = analyze_ema(stock_symbol)
+    macd_result, _ = analyze_macd(stock_symbol)
+
+    return f"""
+📊 Stock Analysis for {stock_symbol}:
+
+- {rsi_result}
+- {ema_result}
+- {macd_result}
+"""
+
+# --- Gradio UI
+with gr.Blocks() as demo:
+    gr.Markdown("# 📈 Agentic-Stonks")
+    with gr.Tab("Stock Advisor"):
+        stock_input = gr.Textbox(label="Stock Symbol", placeholder="e.g. AAPL")
+        stock_output = gr.Textbox(label="Analysis")
+        run_btn = gr.Button("Analyze")
+        run_btn.click(stock_advisor, inputs=stock_input, outputs=stock_output)
 
 #use if key is stored locally
 load_dotenv()
@@ -125,6 +150,12 @@ def build_ui():
     with gr.Blocks(title="Stock Viewer + Chat") as demo:
         gr.Markdown("# 📈 AgenticStonks Dashboard")
 
+        with gr.Tab("Stock Advisor"): #Attaches the Stock Advisor to the UI
+            stock_input = gr.Textbox(label="Stock Symbol", placeholder="e.g. AAPL")
+            stock_output = gr.Markdown(label="Analysis")  # switched to Markdown
+            run_btn = gr.Button("Analyze")
+            run_btn.click(stock_advisor, inputs=stock_input, outputs=stock_output)
+
         with gr.Row():   # Side-by-side layout
             # ----- LEFT: Stock Viewer -----
             with gr.Column(scale=2):
@@ -188,5 +219,10 @@ def build_ui():
                     title="💬 Stock Assistant",
                     description="Ask me questions about stocks while watching the chart!"
                 )
-
     return demo
+
+
+# ------ Entry point -----
+if __name__ == "__main__":
+    demo = build_ui()
+    demo.launch(server_name="127.0.0.1", server_port=7860) # Change server port to match the server you're using
