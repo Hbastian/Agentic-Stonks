@@ -1,44 +1,69 @@
 #!/bin/bash
-# One-shot setup, run, and clean exit for Agentic-Stonks
+# macOS setup + run script for Agentic-Stonks
+# Ensures Python 3.12+ (via Homebrew), venv exists, and dependencies are current.
 
-set -e  # exit immediately on error
+set -e  # exit on error
 
-# Create venv if it doesn't exist
-if [ ! -d ".venv" ]; then
-    echo "Creating virtual environment..."
-    python3 -m venv .venv
+# --- Step 1: Ensure Homebrew is installed ---
+if ! command -v brew >/dev/null 2>&1; then
+    echo "Homebrew not found."
+    echo "Install Homebrew first: https://brew.sh/"
+    exit 1
 fi
 
-# Activate venv
+# --- Step 2: Ensure Python 3.12+ is installed ---
+if ! command -v python3.12 >/dev/null 2>&1; then
+    echo "Python 3.12 not found. Installing with Homebrew..."
+    brew install python@3.12
+    brew link --overwrite python@3.12
+fi
+
+PYTHON=python3.12
+VERSION=$($PYTHON -c 'import sys; print(".".join(map(str, sys.version_info[:3])))')
+MAJOR=$(echo $VERSION | cut -d. -f1)
+MINOR=$(echo $VERSION | cut -d. -f2)
+
+if [ "$MAJOR" -lt 3 ] || [ "$MINOR" -lt 12 ]; then
+    echo "Detected Python $VERSION"
+    echo "Agentic-Stonks requires Python 3.12 or newer."
+    echo "Please upgrade with: brew install python@3.12"
+    exit 1
+fi
+
+echo "✅ Using Python $VERSION"
+
+# --- Step 3: Create venv if missing ---
+if [ ! -d ".venv" ]; then
+    echo "Creating virtual environment..."
+    $PYTHON -m venv .venv
+fi
+
+# --- Step 4: Activate venv ---
 echo "Activating virtual environment..."
 source .venv/bin/activate
 
-# Upgrade pip quietly
-python -m pip install --upgrade pip -q
+# --- Step 5: Upgrade pip/setuptools/wheel ---
 
-# Check if requirements.txt is newer than installed packages
-REQ_HASH_FILE=".venv/.requirements_hash"
-NEW_HASH=$(md5sum requirements.txt | awk '{print $1}')
+python -m pip install --upgrade pip setuptools wheel -q
 
-if [ ! -f "$REQ_HASH_FILE" ] || [ "$NEW_HASH" != "$(cat $REQ_HASH_FILE)" ]; then
-    echo "Installing/updating requirements..."
-    python -m pip install -r requirements.txt
-    echo "$NEW_HASH" > "$REQ_HASH_FILE"
-else
-    echo "Requirements are up to date. Skipping reinstall."
-fi
+# --- Step 6: Install/upgrade requirements ---
+echo "Installing/upgrading requirements..."
+python -m pip install --upgrade -r requirements.txt -q
 
-# Load .env if present
+# --- Step 7: Sanity check pandas ---
+python -c "import pandas" 2>/dev/null || {
+    echo "Pandas seems broken. Reinstalling cleanly..."
+    python -m pip install --force-reinstall --no-cache-dir pandas
+}
+
+# --- Step 8: Load environment variables ---
 if [ -f ".env" ]; then
-    echo "Loading environment variables from .env..."
-    # export each line in .env into the environment
     export $(grep -v '^#' .env | xargs)
 fi
 
-# Run the app
-echo "Starting Flask + Gradio app..."
+# --- Step 9: Run the app ---
 python app.py
 
-# Deactivate venv when done
+# --- Step 10: Cleanup ---
 echo "Deactivating virtual environment..."
 deactivate

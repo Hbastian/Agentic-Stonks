@@ -184,9 +184,11 @@ def stock_chat(message, history):
             model="gpt-4o-mini",
             messages=messages
         )
-        return resp.choices[0].message.content
+        reply = resp.choices[0].message.content
+        history.append((message, reply))
+        return reply, history  # 👈 return tuple
     except Exception as e:
-        return f"Error: {str(e)}"
+        return f"Error: {str(e)}", history
 
 # ---------- UI Builder ----------
 def build_ui():
