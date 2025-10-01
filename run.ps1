@@ -1,55 +1,94 @@
 # run.ps1
-# One-shot setup, run, and clean exit for Agentic-Stonks (Windows PowerShell)
+# Windows setup + run script for Agentic-Stonks
+# Ensures Python 3.12+, venv exists, and dependencies are current.
 
 $ErrorActionPreference = "Stop"
 
-# Path to venv
-$venvPath = ".venv"
+Write-Host "=== Agentic-Stonks Setup (Windows PowerShell) ===`n"
 
-# Create venv if it doesn't exist
-if (-Not (Test-Path $venvPath)) {
-    Write-Output "Creating virtual environment..."
-    python -m venv $venvPath
+# --- Step 1: Check for Python 3.12 ---
+$pythonCmd = Get-Command python3.12 -ErrorAction SilentlyContinue
+if (-not $pythonCmd) {
+    $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
 }
 
-# Activate venv
-Write-Output "Activating virtual environment..."
-& "$venvPath\Scripts\Activate.ps1"
-
-# Upgrade pip quietly
-python -m pip install --upgrade pip -q
-
-# Hash requirements.txt to detect changes
-$reqHashFile = "$venvPath\.requirements_hash"
-$newHash = (Get-FileHash requirements.txt -Algorithm MD5).Hash
-
-if (-Not (Test-Path $reqHashFile) -or (Get-Content $reqHashFile) -ne $newHash) {
-    Write-Output "Installing/updating requirements..."
-    python -m pip install -r requirements.txt
-    $newHash | Out-File $reqHashFile -Encoding ASCII
-} else {
-    Write-Output "Requirements are up to date. Skipping reinstall."
+if (-not $pythonCmd) {
+    Write-Host "⚠️ Python 3.12 not found."
+    $choice = Read-Host "Would you like to install Python 3.12 via winget? (y/n)"
+    if ($choice -match '^[Yy]$') {
+        if (Get-Command winget -ErrorAction SilentlyContinue) {
+            Write-Host "📦 Installing Python 3.12..."
+            winget install -e --id Python.Python.3.12 -h --accept-package-agreements --accept-source-agreements
+            $pythonCmd = Get-Command python3.12 -ErrorAction SilentlyContinue
+            if (-not $pythonCmd) {
+                Write-Host "❌ Python 3.12 installation failed. Please install manually: https://www.python.org/downloads/"
+                exit 1
+            }
+        } else {
+            Write-Host "❌ winget not found. Please install Python 3.12 manually: https://www.python.org/downloads/"
+            exit 1
+        }
+    } else {
+        Write-Host "❌ Python 3.12 is required. Please install manually from https://www.python.org/downloads/"
+        exit 1
+    }
 }
 
-# Load .env if present
+$PYTHON = $pythonCmd.Source
+$VERSION = & $PYTHON -c "import sys; print('.'.join(map(str, sys.version_info[:3])))"
+$MAJOR,$MINOR,$PATCH = $VERSION.Split(".")
+
+if ([int]$MAJOR -lt 3 -or [int]$MINOR -lt 12) {
+    Write-Host "❌ Detected Python $VERSION"
+    Write-Host "⚠️ Agentic-Stonks requires Python 3.12 or newer."
+    Write-Host "👉 Please upgrade from https://www.python.org/downloads/"
+    exit 1
+}
+
+Write-Host "✅ Using Python $VERSION"
+
+# --- Step 2: Create venv if missing ---
+if (-not (Test-Path ".venv")) {
+    Write-Host "📦 Creating virtual environment..."
+    & $PYTHON -m venv .venv | Out-Null
+}
+
+# --- Step 3: Activate venv ---
+Write-Host "🔗 Activating virtual environment..."
+. .\.venv\Scripts\Activate.ps1
+
+# --- Step 4: Upgrade pip/setuptools/wheel ---
+Write-Host "⬆️ Upgrading pip, setuptools, wheel..."
+python -m pip install --upgrade pip setuptools wheel -q
+
+# --- Step 5: Install/upgrade requirements ---
+Write-Host "📥 Installing project requirements..."
+python -m pip install --upgrade -r requirements.txt -q
+
+# --- Step 6: Sanity check pandas ---
+try {
+    python -c "import pandas" | Out-Null
+} catch {
+    Write-Host "⚠️ Pandas seems broken. Reinstalling cleanly..."
+    python -m pip install --force-reinstall --no-cache-dir pandas -q
+}
+
+# --- Step 7: Load environment variables ---
 if (Test-Path ".env") {
-    Write-Output "Loading environment variables from .env..."
+    Write-Host "🌱 Loading .env variables..."
     Get-Content .env | ForEach-Object {
         if ($_ -match "^\s*#") { return } # skip comments
-        if ($_ -match "^\s*$") { return } # skip empty lines
-        $parts = $_ -split '=', 2
-        if ($parts.Count -eq 2) {
-            $key = $parts[0].Trim()
-            $val = $parts[1].Trim()
-            $env:$key = $val
+        $parts = $_.Split("=",2)
+        if ($parts.Length -eq 2) {
+            [System.Environment]::SetEnvironmentVariable($parts[0], $parts[1])
         }
     }
 }
 
-# Run the app
-Write-Output "Starting Flask + Gradio app..."
+# --- Step 8: Run the app ---
+Write-Host "🚀 Starting Flask + Gradio app..."
 python app.py
 
-# Deactivate venv
-Write-Output "Deactivating virtual environment..."
+# --- Step 9: Cleanup ---
+Write-Host "🛑 Deactivating virtual environment..."
 deactivate
