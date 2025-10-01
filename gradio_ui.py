@@ -175,9 +175,11 @@ def stock_chat(message, history):
     try:
         messages = [{"role": "system",
                      "content": "You are a helpful financial assistant. Answer questions about stocks clearly."}]
-        for user, bot in history:
-            messages.append({"role": "user", "content": user})
-            messages.append({"role": "assistant", "content": bot})
+
+        # history is already a list of {"role": ..., "content": ...}
+        messages.extend(history)
+
+        # add the latest user message
         messages.append({"role": "user", "content": message})
 
         resp = client.chat.completions.create(
@@ -187,7 +189,6 @@ def stock_chat(message, history):
         return resp.choices[0].message.content
     except Exception as e:
         return f"Error: {str(e)}"
-
 # ---------- UI Builder ----------
 def build_ui():
     with gr.Blocks(title="AgenticStonks Dashboard") as demo:
