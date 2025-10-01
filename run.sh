@@ -57,18 +57,21 @@ fi
 echo "🔗 Activating virtual environment..."
 source .venv/bin/activate
 
+# Always use venv Python explicitly
+VENV_PYTHON=$(pwd)/.venv/bin/python
+
 # --- Step 5: Upgrade pip/setuptools/wheel ---
 echo "⬆️ Upgrading pip, setuptools, wheel..."
-python -m pip install --upgrade pip setuptools wheel -q
+$VENV_PYTHON -m pip install --upgrade pip setuptools wheel -q
 
 # --- Step 6: Install/upgrade requirements ---
 echo "📥 Installing project requirements..."
-python -m pip install --upgrade -r requirements.txt -q
+$VENV_PYTHON -m pip install --upgrade -r requirements.txt -q
 
 # --- Step 7: Sanity check pandas ---
-python -c "import pandas" 2>/dev/null || {
+$VENV_PYTHON -c "import pandas" 2>/dev/null || {
     echo "⚠️ Pandas seems broken. Reinstalling cleanly..."
-    python -m pip install --force-reinstall --no-cache-dir pandas -q
+    $VENV_PYTHON -m pip install --force-reinstall --no-cache-dir pandas
 }
 
 # --- Step 8: Load environment variables ---
@@ -79,7 +82,7 @@ fi
 
 # --- Step 9: Run the app ---
 echo "🚀 Starting Flask + Gradio app..."
-python app.py
+$VENV_PYTHON app.py
 
 # --- Step 10: Cleanup ---
 echo "🛑 Deactivating virtual environment..."

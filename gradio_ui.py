@@ -1,4 +1,3 @@
-
 import gradio as gr
 import yfinance as yf
 import plotly.graph_objects as go
@@ -7,10 +6,9 @@ import os
 import math
 from typing import Dict, Any
 from openai import OpenAI
-#import the following if running locally, otehrwise comment out
 from dotenv import load_dotenv
 
-#use if key is stored locally
+# Load environment variables
 load_dotenv()
 
 # ---------- OpenAI setup ----------
@@ -114,21 +112,27 @@ def analyze_macd(hist):
         verdict = "Bearish (MACD below Signal)"
     return f"MACD: {latest_macd:.2f} vs Signal={latest_signal:.2f} → {verdict}"
 
-# ---------- Summary builder ----------
-def _build_summary(info, ticker: str, hist):
-    return (
-        f"### {info.get('shortName', ticker)} ({ticker.upper()})\n\n"
-        f"💰 **Current Price:** {info.get('currentPrice', 'N/A')}\n"
-        f"📉 **Previous Close:** {info.get('previousClose', 'N/A')}\n\n"
-        f"🏦 **Market Cap:** {_format_number(info.get('marketCap'))}\n"
-        f"📊 **Volume:** {_format_number(info.get('volume'))}\n\n"
-        f"📈 **52W High:** {info.get('fiftyTwoWeekHigh', 'N/A')}\n"
-        f"📉 **52W Low:** {info.get('fiftyTwoWeekLow', 'N/A')}\n\n"
-        f"📊 **Indicators:**\n"
-        f"- {analyze_rsi(hist)}\n"
-        f"- {analyze_ema(hist)}\n"
-        f"- {analyze_macd(hist)}\n"
-    )
+# ---------- Indicator Collector ----------
+def collect_indicators(ticker: str, view_choice: str, period_choice: str):
+    interval = _choose_interval(view_choice, period_choice)
+    effective_period = period_choice or "6mo"
+
+    stock = yf.Ticker(ticker)
+    hist = stock.history(period=effective_period, interval=interval)
+    if hist.empty:
+        return {}
+
+    ma20 = hist["Close"].rolling(window=20).mean().iloc[-1]
+    ma50 = hist["Close"].rolling(window=50).mean().iloc[-1]
+
+    return {
+        "MA20": f"MA20: {ma20:.2f}",
+        "MA50": f"MA50: {ma50:.2f}",
+        "RSI": analyze_rsi(hist),
+        "EMA": analyze_ema(hist),
+        "MACD": analyze_macd(hist),
+        "Timeframe": f"{effective_period}, interval={interval}"
+    }
 
 # ---------- Interval chooser ----------
 def _choose_interval(view_choice: str, period_choice: str) -> str:
@@ -144,43 +148,57 @@ def get_stock_info(ticker: str, view_choice: str, period_choice: str,
 
     key = (ticker or "", view_choice, effective_period, bool(show_ma), bool(show_volume))
     cached = _last_outputs.get(key, {"last_ts": None, "summary": "Waiting for data...",
-                                     "fig": None, "updated": "—"})
+                                     "fig": None, "updated": "—",
+                                     "indicators": {}})
 
     if not (ticker and ticker.strip()):
-        return cached["summary"], cached["fig"], cached["updated"]
+        return cached["summary"], cached["fig"], cached["updated"], cached["indicators"]
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period=effective_period, interval=interval)
         if hist is None or hist.empty:
-            return cached["summary"], cached["fig"], cached["updated"]
+            return cached["summary"], cached["fig"], cached["updated"], cached["indicators"]
         current_last_ts = hist.index[-1]
         if cached["last_ts"] is not None and current_last_ts == cached["last_ts"]:
-            return gr.update(), gr.update(), cached["updated"]
+            return gr.update(), gr.update(), cached["updated"], cached["indicators"]
 
         info = stock.info
-        summary = _build_summary(info, ticker, hist)
+        summary = (
+            f"### {info.get('shortName', ticker)} ({ticker.upper()})\n\n"
+            f"💰 **Current Price:** {info.get('currentPrice', 'N/A')}\n"
+            f"📉 **Previous Close:** {info.get('previousClose', 'N/A')}\n\n"
+            f"🏦 **Market Cap:** {_format_number(info.get('marketCap'))}\n"
+            f"📊 **Volume:** {_format_number(info.get('volume'))}\n\n"
+            f"📈 **52W High:** {info.get('fiftyTwoWeekHigh', 'N/A')}\n"
+            f"📉 **52W Low:** {info.get('fiftyTwoWeekLow', 'N/A')}\n"
+        )
 
         title = f"{ticker.upper()} — {view_choice} view over {effective_period} (interval={interval})"
         fig = _build_chart(hist, show_ma, show_volume, title)
         updated = datetime.datetime.now().strftime("Last updated: %Y-%m-%d %H:%M:%S")
 
+        indicators = collect_indicators(ticker, view_choice, period_choice)
+
         _last_outputs[key] = {"last_ts": current_last_ts,
-                              "summary": summary, "fig": fig, "updated": updated}
-        return summary, fig, updated
+                              "summary": summary, "fig": fig, "updated": updated, "indicators": indicators}
+        return summary, fig, updated, indicators
     except Exception:
-        return cached["summary"], cached["fig"], cached["updated"]
+        return cached["summary"], cached["fig"], cached["updated"], cached["indicators"]
 
 # ---------- Chatbot ----------
-def stock_chat(message, history):
+def stock_chat(message, history, ticker="AAPL", view_choice="Daily", period_choice="6mo"):
     try:
-        messages = [{"role": "system",
-                     "content": "You are a helpful financial assistant. Answer questions about stocks clearly."}]
+        indicators = collect_indicators(ticker, view_choice, period_choice)
+        context = (
+            f"Ticker: {ticker.upper()} | View: {view_choice}, Timeframe: {period_choice}\n" +
+            "\n".join([f"{v}" for v in indicators.values() if v]) + "\n\n"
+        )
 
-        # history is already a list of {"role": ..., "content": ...}
+        messages = [
+            {"role": "system", "content": "You are a helpful financial assistant. Use the stock indicators provided when answering."},
+        ]
         messages.extend(history)
-
-        # add the latest user message
-        messages.append({"role": "user", "content": message})
+        messages.append({"role": "user", "content": context + message})
 
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -190,15 +208,18 @@ def stock_chat(message, history):
     except Exception as e:
         return f"Error: {str(e)}"
 
-
 # ---------- UI Builder ----------
 def build_ui():
     with gr.Blocks(title="AgenticStonks Dashboard") as demo:
         gr.Markdown("# 📈 AgenticStonks Dashboard")
 
-        with gr.Row():   # Side-by-side layout
-            # ----- LEFT: Stock Viewer -----
-            with gr.Column(scale=2):
+        current_ticker = gr.State("AAPL")
+        current_view = gr.State("Daily")
+        current_period = gr.State("6mo")
+
+        with gr.Row():
+            # ----- LEFT: Stock Viewer (wider) -----
+            with gr.Column(scale=3):
                 with gr.Row():
                     ticker_dropdown = gr.Dropdown(
                         label="Select Stock Symbol (Quick Picks)",
@@ -210,48 +231,58 @@ def build_ui():
                         placeholder="e.g. AMD, SPY, NFLX",
                         value="",
                     )
+                    view_choice = gr.Radio(label="View Type", choices=["Daily", "Weekly"], value="Daily")
+                    period_choice = gr.Radio(label="Time Frame", choices=ALLOWED_PERIODS, value="6mo")
+                    show_ma = gr.Checkbox(label="Show MA-20 / MA-50", value=True)
+                    show_volume = gr.Checkbox(label="Show Volume Bars", value=True)
 
-                view_choice = gr.Radio(label="View Type", choices=["Daily", "Weekly"], value="Daily")
-                period_choice = gr.Radio(label="Time Frame", choices=ALLOWED_PERIODS, value="6mo")
-                show_ma = gr.Checkbox(label="Show MA-20 / MA-50", value=True)
-                show_volume = gr.Checkbox(label="Show Volume Bars", value=True)
+                default_summary, default_chart, default_updated, default_indicators = get_stock_info("AAPL", "Daily", "6mo", True, True)
 
-                # preload
-                default_summary, default_chart, default_updated = get_stock_info("AAPL", "Daily", "6mo", True, True)
-                stock_output = gr.Markdown(value=default_summary)
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        stock_output = gr.Markdown(value=default_summary)
+                    with gr.Column(scale=1):
+                        gr.Markdown("### 📊 Indicators")
+                        rsi_out = gr.Markdown(value=default_indicators.get("RSI", ""))
+                        ema_out = gr.Markdown(value=default_indicators.get("EMA", ""))
+                        macd_out = gr.Markdown(value=default_indicators.get("MACD", ""))
+                        ma20_out = gr.Markdown(value=default_indicators.get("MA20", ""))
+                        ma50_out = gr.Markdown(value=default_indicators.get("MA50", ""))
+
                 stock_chart = gr.Plot(value=default_chart)
                 last_updated = gr.Markdown(value=default_updated)
 
                 def _inputs_for(fn):
                     return dict(
-                        fn=fn,
-                        inputs=[ticker_dropdown, view_choice, period_choice, show_ma, show_volume],
-                        outputs=[stock_output, stock_chart, last_updated]
+                        fn=lambda dropdown_val, textbox_val, view, period, ma, volume: fn(
+                            textbox_val.strip().upper() if textbox_val.strip() else dropdown_val,
+                            view, period, ma, volume
+                        ),
+                        inputs=[ticker_dropdown, ticker_textbox, view_choice, period_choice, show_ma, show_volume],
+                        outputs=[stock_output, stock_chart, last_updated, rsi_out, ema_out, macd_out, ma20_out, ma50_out]
                     )
 
                 ticker_dropdown.change(**_inputs_for(get_stock_info))
-                ticker_textbox.change(
-                    fn=lambda text_val, *rest: get_stock_info(
-                        text_val.strip().upper() if text_val.strip() else ticker_dropdown.value, *rest
-                    ),
-                    inputs=[ticker_textbox, view_choice, period_choice, show_ma, show_volume],
-                    outputs=[stock_output, stock_chart, last_updated]
-                )
+                ticker_textbox.change(**_inputs_for(get_stock_info))
                 view_choice.change(**_inputs_for(get_stock_info))
                 period_choice.change(**_inputs_for(get_stock_info))
                 show_ma.change(**_inputs_for(get_stock_info))
                 show_volume.change(**_inputs_for(get_stock_info))
 
                 gr.Timer(30.0).tick(
-                    fn=lambda *a: get_stock_info(*a),
+                    fn=lambda dropdown_val, textbox_val, view, period, ma, volume: get_stock_info(
+                        textbox_val.strip().upper() if textbox_val.strip() else dropdown_val,
+                        view, period, ma, volume
+                    ),
                     inputs=[ticker_dropdown, ticker_textbox, view_choice, period_choice, show_ma, show_volume],
-                    outputs=[stock_output, stock_chart, last_updated]
+                    outputs=[stock_output, stock_chart, last_updated, rsi_out, ema_out, macd_out, ma20_out, ma50_out]
                 )
 
-            # ----- RIGHT: Chatbox -----
+            # ----- RIGHT: Chatbox (narrower) -----
             with gr.Column(scale=1):
                 gr.ChatInterface(
-                    fn=stock_chat,
+                    fn=lambda m, h: stock_chat(m, h, ticker_dropdown.value or ticker_textbox.value or "AAPL",
+                                               view_choice.value, period_choice.value),
                     type="messages",
                     title="💬 Stonk Assistant",
                     description="Ask me questions about stocks while watching the chart!"
