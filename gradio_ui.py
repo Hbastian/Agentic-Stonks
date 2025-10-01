@@ -179,18 +179,17 @@ def stock_chat(message, history):
         # history is already a list of {"role": ..., "content": ...}
         messages.extend(history)
 
-        # Add new user message
+        # add the latest user message
         messages.append({"role": "user", "content": message})
 
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages
         )
-        reply = resp.choices[0].message.content
-        history.append((message, reply))
-        return reply, history  # 👈 return tuple
+        return resp.choices[0].message.content
     except Exception as e:
-        return f"Error: {str(e)}", history
+        return f"Error: {str(e)}"
+
 
 # ---------- UI Builder ----------
 def build_ui():
