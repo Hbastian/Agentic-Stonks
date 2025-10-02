@@ -23,9 +23,8 @@ VIEW_INTERVALS = {
 # ---------- Allowed periods ----------
 ALLOWED_PERIODS = ["3mo", "6mo", "1y", "2y", "3y"]
 
-# ---------- Cache + top-of-hour guard ----------
+# ---------- Cache ----------
 _last_outputs: Dict[tuple, Dict[str, Any]] = {}
-_last_top_hour_key = None  # (year, month, day, hour)
 
 # ---------- Global indicator cache for chat ----------
 _latest_indicators = {}
@@ -149,10 +148,10 @@ def get_stock_info(ticker: str, view_choice: str, period_choice: str,
     interval = _choose_interval(view_choice, period_choice)
     effective_period = period_choice or "6mo"
 
-    key = (ticker or "", view_choice, effective_period, bool(show_ma), bool(show_volume))
-    cached = _last_outputs.get(key, {"last_ts": None, "summary": "Waiting for data...",
-                                     "fig": None, "updated": "—",
-                                     "indicators": {}})
+    # ✅ include interval in cache key
+    key = (ticker or "", view_choice, interval, effective_period, bool(show_ma), bool(show_volume))
+    cached = _last_outputs.get(key, {"summary": "Waiting for data...", "fig": None,
+                                     "updated": "—", "indicators": {}})
 
     def _pack_outputs(summary, fig, updated, indicators):
         return (
@@ -166,15 +165,12 @@ def get_stock_info(ticker: str, view_choice: str, period_choice: str,
 
     if not (ticker and ticker.strip()):
         return _pack_outputs(cached["summary"], cached["fig"], cached["updated"], cached["indicators"])
+
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period=effective_period, interval=interval)
         if hist is None or hist.empty:
-            return _pack_outputs(cached["summary"], cached["fig"], cached["updated"], cached["indicators"])
-
-        current_last_ts = hist.index[-1]
-        if cached["last_ts"] is not None and current_last_ts == cached["last_ts"]:
-            return _pack_outputs(cached["summary"], cached["fig"], cached["updated"], cached["indicators"])
+            return _pack_outputs(f"⚠️ No data found for {ticker}", None, "—", {})
 
         info = stock.info
         summary = (
@@ -193,12 +189,11 @@ def get_stock_info(ticker: str, view_choice: str, period_choice: str,
 
         indicators = collect_indicators(ticker, view_choice, period_choice)
 
-        # ✅ Save latest indicators for chat reuse
         global _latest_indicators
         _latest_indicators = indicators
 
-        _last_outputs[key] = {"last_ts": current_last_ts,
-                              "summary": summary, "fig": fig, "updated": updated, "indicators": indicators}
+        _last_outputs[key] = {"summary": summary, "fig": fig,
+                              "updated": updated, "indicators": indicators}
         return _pack_outputs(summary, fig, updated, indicators)
 
     except Exception:
@@ -209,7 +204,6 @@ def stock_chat(message, history, dropdown_val, textbox_val, view_choice, period_
     try:
         ticker = (textbox_val or "").strip().upper() or dropdown_val or "AAPL"
 
-        # ✅ use latest indicators from UI if available
         global _latest_indicators
         indicators = _latest_indicators or collect_indicators(ticker, view_choice, period_choice)
 
