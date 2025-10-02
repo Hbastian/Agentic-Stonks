@@ -27,6 +27,9 @@ ALLOWED_PERIODS = ["3mo", "6mo", "1y", "2y", "3y"]
 _last_outputs: Dict[tuple, Dict[str, Any]] = {}
 _last_top_hour_key = None  # (year, month, day, hour)
 
+# ---------- Global indicator cache for chat ----------
+_latest_indicators = {}
+
 # ---------- Chart builder ----------
 def _build_chart(hist, show_ma: bool, show_volume: bool, title: str):
     fig = go.Figure()
@@ -151,16 +154,27 @@ def get_stock_info(ticker: str, view_choice: str, period_choice: str,
                                      "fig": None, "updated": "—",
                                      "indicators": {}})
 
+    def _pack_outputs(summary, fig, updated, indicators):
+        return (
+            summary, fig, updated,
+            indicators.get("RSI", ""),
+            indicators.get("EMA", ""),
+            indicators.get("MACD", ""),
+            indicators.get("MA20", ""),
+            indicators.get("MA50", "")
+        )
+
     if not (ticker and ticker.strip()):
-        return cached["summary"], cached["fig"], cached["updated"], cached["indicators"]
+        return _pack_outputs(cached["summary"], cached["fig"], cached["updated"], cached["indicators"])
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period=effective_period, interval=interval)
         if hist is None or hist.empty:
-            return cached["summary"], cached["fig"], cached["updated"], cached["indicators"]
+            return _pack_outputs(cached["summary"], cached["fig"], cached["updated"], cached["indicators"])
+
         current_last_ts = hist.index[-1]
         if cached["last_ts"] is not None and current_last_ts == cached["last_ts"]:
-            return gr.update(), gr.update(), cached["updated"], cached["indicators"]
+            return _pack_outputs(cached["summary"], cached["fig"], cached["updated"], cached["indicators"])
 
         info = stock.info
         summary = (
@@ -179,18 +193,28 @@ def get_stock_info(ticker: str, view_choice: str, period_choice: str,
 
         indicators = collect_indicators(ticker, view_choice, period_choice)
 
+        # ✅ Save latest indicators for chat reuse
+        global _latest_indicators
+        _latest_indicators = indicators
+
         _last_outputs[key] = {"last_ts": current_last_ts,
                               "summary": summary, "fig": fig, "updated": updated, "indicators": indicators}
-        return summary, fig, updated, indicators
+        return _pack_outputs(summary, fig, updated, indicators)
+
     except Exception:
-        return cached["summary"], cached["fig"], cached["updated"], cached["indicators"]
+        return _pack_outputs(cached["summary"], cached["fig"], cached["updated"], cached["indicators"])
 
 # ---------- Chatbot ----------
-def stock_chat(message, history, ticker="AAPL", view_choice="Daily", period_choice="6mo"):
+def stock_chat(message, history, dropdown_val, textbox_val, view_choice, period_choice):
     try:
-        indicators = collect_indicators(ticker, view_choice, period_choice)
+        ticker = (textbox_val or "").strip().upper() or dropdown_val or "AAPL"
+
+        # ✅ use latest indicators from UI if available
+        global _latest_indicators
+        indicators = _latest_indicators or collect_indicators(ticker, view_choice, period_choice)
+
         context = (
-            f"Ticker: {ticker.upper()} | View: {view_choice}, Timeframe: {period_choice}\n" +
+            f"Ticker: {ticker} | View: {view_choice}, Timeframe: {period_choice}\n" +
             "\n".join([f"{v}" for v in indicators.values() if v]) + "\n\n"
         )
 
@@ -236,18 +260,27 @@ def build_ui():
                     show_ma = gr.Checkbox(label="Show MA-20 / MA-50", value=True)
                     show_volume = gr.Checkbox(label="Show Volume Bars", value=True)
 
-                default_summary, default_chart, default_updated, default_indicators = get_stock_info("AAPL", "Daily", "6mo", True, True)
+                (
+                    default_summary,
+                    default_chart,
+                    default_updated,
+                    default_rsi,
+                    default_ema,
+                    default_macd,
+                    default_ma20,
+                    default_ma50
+                ) = get_stock_info("AAPL", "Daily", "6mo", True, True)
 
                 with gr.Row():
                     with gr.Column(scale=2):
                         stock_output = gr.Markdown(value=default_summary)
                     with gr.Column(scale=1):
                         gr.Markdown("### 📊 Indicators")
-                        rsi_out = gr.Markdown(value=default_indicators.get("RSI", ""))
-                        ema_out = gr.Markdown(value=default_indicators.get("EMA", ""))
-                        macd_out = gr.Markdown(value=default_indicators.get("MACD", ""))
-                        ma20_out = gr.Markdown(value=default_indicators.get("MA20", ""))
-                        ma50_out = gr.Markdown(value=default_indicators.get("MA50", ""))
+                        rsi_out = gr.Markdown(value=default_rsi)
+                        ema_out = gr.Markdown(value=default_ema)
+                        macd_out = gr.Markdown(value=default_macd)
+                        ma20_out = gr.Markdown(value=default_ma20)
+                        ma50_out = gr.Markdown(value=default_ma50)
 
                 stock_chart = gr.Plot(value=default_chart)
                 last_updated = gr.Markdown(value=default_updated)
@@ -259,7 +292,8 @@ def build_ui():
                             view, period, ma, volume
                         ),
                         inputs=[ticker_dropdown, ticker_textbox, view_choice, period_choice, show_ma, show_volume],
-                        outputs=[stock_output, stock_chart, last_updated, rsi_out, ema_out, macd_out, ma20_out, ma50_out]
+                        outputs=[stock_output, stock_chart, last_updated,
+                                 rsi_out, ema_out, macd_out, ma20_out, ma50_out]
                     )
 
                 ticker_dropdown.change(**_inputs_for(get_stock_info))
@@ -275,14 +309,15 @@ def build_ui():
                         view, period, ma, volume
                     ),
                     inputs=[ticker_dropdown, ticker_textbox, view_choice, period_choice, show_ma, show_volume],
-                    outputs=[stock_output, stock_chart, last_updated, rsi_out, ema_out, macd_out, ma20_out, ma50_out]
+                    outputs=[stock_output, stock_chart, last_updated,
+                             rsi_out, ema_out, macd_out, ma20_out, ma50_out]
                 )
 
             # ----- RIGHT: Chatbox (narrower) -----
             with gr.Column(scale=1):
                 gr.ChatInterface(
-                    fn=lambda m, h: stock_chat(m, h, ticker_dropdown.value or ticker_textbox.value or "AAPL",
-                                               view_choice.value, period_choice.value),
+                    fn=stock_chat,
+                    additional_inputs=[ticker_dropdown, ticker_textbox, view_choice, period_choice],
                     type="messages",
                     title="💬 Stonk Assistant",
                     description="Ask me questions about stocks while watching the chart!"
