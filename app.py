@@ -11,7 +11,7 @@ import os
 import atexit
 from gradio_ui import build_ui
 
-# Create Flask app
+# test reate Flask app
 app = Flask(__name__)
 
 # Store chosen Gradio port + demo ref
