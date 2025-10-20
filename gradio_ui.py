@@ -1,6 +1,7 @@
 # gradio_ui.py — v2 (two columns: chart + collapsible insight card | chat on right)
 import os
 import gradio as gr
+image_path = os.path.join("images", "Agentic-Stonks.png")
 from dotenv import load_dotenv
 from analysis import analyze_ticker
 
@@ -9,6 +10,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if OPENAI_API_KEY:
     try:
         from openai import OpenAI
+
         _client = OpenAI(api_key=OPENAI_API_KEY)
     except Exception:
         _client = None
@@ -19,12 +21,14 @@ load_dotenv()
 DEFAULT_TICKER = "AAPL"
 LATEST_CONTEXT = {"ticker": DEFAULT_TICKER}
 
+
 def run_analysis(ticker_dd, ticker_txt, period, interval):
     ticker = (ticker_txt or "").strip().upper() or (ticker_dd or DEFAULT_TICKER)
     fig, card_html, ctx = analyze_ticker(ticker, period=period, interval=interval)
     global LATEST_CONTEXT
     LATEST_CONTEXT = ctx or {"ticker": ticker}
     return fig, card_html
+
 
 def chat_reply(message, history):
     """
@@ -88,21 +92,24 @@ Rules:
         txt.append(f"- RSI: **{r:.1f}** ({zone}).")
     if ctx.get("poc") is not None:
         txt.append(f"- Most-traded price (POC): ~${ctx['poc']:.2f}.")
-    f = ctx.get("fibs", {}); imp = [k for k in ("38%","50%","62%","61%") if k in f]
+    f = ctx.get("fibs", {});
+    imp = [k for k in ("38%", "50%", "62%", "61%") if k in f]
     if imp:
         txt.append("- Fibonacci zones: " + ", ".join([f"{k} ≈ ${f[k]:.2f}" for k in imp]))
-    txt.append("\nI'm running in offline mode (no model connected), so this is a quick summary. Add your OpenAI key to get conversational replies.")
+    txt.append(
+        "\nI'm running in offline mode (no model connected), so this is a quick summary. Add your OpenAI key to get conversational replies.")
     return "\n".join(txt)
+
 
 def build_ui():
     with gr.Blocks(
-        title="Agentic-Stonks",
-        theme=gr.themes.Soft(primary_hue="orange", neutral_hue="gray"),
+            title="Agentic-Stonks",
+            theme=gr.themes.Soft(primary_hue="orange", neutral_hue="gray"),
             css="""
             /* Theme adaptive colors */
             :root {
                 --bg-light: #f9f9fb;
-                --text-light: #111;
+                --text-light: #000;
                 --panel-light: #fff;
                 --muted-light: #555;
 
@@ -111,6 +118,12 @@ def build_ui():
                 --panel-dark: #13151a;
                 --muted-dark: #a1a1a1;
             }
+                .logo-box,.logo-box img {
+                    max-width: 120px !important;
+                    height: auto !important;
+                    background: transparent !important;
+            }
+
 
             @media (prefers-color-scheme: dark) {
                 :root {
@@ -148,22 +161,35 @@ def build_ui():
         """
     ) as demo:
 
-        gr.HTML("<div class='header'>📈 Agentic-Stonks — Explain, Advise, Interpret</div>"
-                "<div class='subtext'>Educational use only. Not financial advice.</div>")
+        with gr.Row():
+            gr.Image(
+                value="images/Agentic_Stonks.png",
+                show_label=False,
+
+                elem_id="logo",
+                elem_classes=["logo-box"]
+            )
+            gr.HTML("<div class='header'>"
+                    "<span>Agentic-Stonks — Explain, Advise, Interpret</span>"
+                    "<div class='subtext'>Educational use only. Not financial advice.</div>"
+                    "</div>")
+
 
         with gr.Row(equal_height=True):
             # Left column: controls, chart, insight card
             with gr.Column(scale=6):
                 with gr.Row():
                     ticker_dd = gr.Dropdown(label="Choose stock",
-                        choices=["AAPL","TSLA","MSFT","AMZN","GOOG","META","NVDA","NFLX","SPY","QQQ","KO","AMD"],
-                        value=DEFAULT_TICKER, scale=2)
+                                            choices=["AAPL", "TSLA", "MSFT", "AMZN", "GOOG", "META", "NVDA", "NFLX",
+                                                     "SPY", "QQQ", "KO", "AMD"],
+                                            value=DEFAULT_TICKER, scale=2)
                     ticker_txt = gr.Textbox(label="Or type symbol", placeholder="e.g. AMD, BTC-USD", scale=2)
-                    period     = gr.Dropdown(label="Period",
-                        choices=["1mo","3mo","6mo","1y","2y","5y","10y","max"], value="1y", scale=1)
-                    interval   = gr.Dropdown(label="Interval",
-                        choices=["1d","1h","30m","15m","5m","1m"], value="1d", scale=1)
-                    run_btn    = gr.Button("Analyze", variant="primary")
+                    period = gr.Dropdown(label="Period",
+                                         choices=["1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"], value="1y",
+                                         scale=1)
+                    interval = gr.Dropdown(label="Interval",
+                                           choices=["1d", "1h", "30m", "15m", "5m", "1m"], value="1d", scale=1)
+                    run_btn = gr.Button("Analyze", variant="primary")
 
                 chart = gr.Plot(label="Chart (Price + EMA/BB + Volume Profile • MACD • RSI • Volume)")
                 insight = gr.HTML()
@@ -192,6 +218,7 @@ def build_ui():
         gr.HTML("<div class='footer'>© Agentic-Stonks · Educational only · Built with Gradio</div>")
 
     return demo
+
 
 if __name__ == "__main__":
     ui = build_ui()
