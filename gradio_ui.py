@@ -165,7 +165,6 @@ def build_ui():
             gr.Image(
                 value="images/Agentic_Stonks.png",
                 show_label=False,
-
                 elem_id="logo",
                 elem_classes=["logo-box"]
             )
