@@ -1,265 +1,224 @@
-
-import gradio as gr
-import yfinance as yf
-import plotly.graph_objects as go
-import datetime
+# gradio_ui.py — v2 (two columns: chart + collapsible insight card | chat on right)
 import os
-import math
-from typing import Dict, Any
-from openai import OpenAI
-#import the following if running locally, otehrwise comment out
+import gradio as gr
+image_path = os.path.join("images", "Agentic-Stonks.png")
 from dotenv import load_dotenv
+from analysis import analyze_ticker
 
-#use if key is stored locally
+# Optional OpenAI chat (conversational replies)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if OPENAI_API_KEY:
+    try:
+        from openai import OpenAI
+
+        _client = OpenAI(api_key=OPENAI_API_KEY)
+    except Exception:
+        _client = None
+else:
+    _client = None
+
 load_dotenv()
-
-# ---------- OpenAI setup ----------
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-# ---------- View to interval mapping ----------
-VIEW_INTERVALS = {
-    "Daily": "1h",   # hourly candles
-    "Weekly": "1d",  # daily candles
-}
-
-# ---------- Allowed periods ----------
-ALLOWED_PERIODS = ["3mo", "6mo", "1y", "2y", "3y"]
-
-# ---------- Cache + top-of-hour guard ----------
-_last_outputs: Dict[tuple, Dict[str, Any]] = {}
-_last_top_hour_key = None  # (year, month, day, hour)
-
-# ---------- Chart builder ----------
-def _build_chart(hist, show_ma: bool, show_volume: bool, title: str):
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=hist.index, open=hist["Open"], high=hist["High"],
-        low=hist["Low"], close=hist["Close"], name="Price"
-    ))
-    if show_ma and not hist.empty:
-        ma20 = hist["Close"].rolling(window=20).mean()
-        ma50 = hist["Close"].rolling(window=50).mean()
-        fig.add_trace(go.Scatter(x=hist.index, y=ma20, mode="lines",
-                                 name="MA-20", line=dict(color="yellow", width=1.5)))
-        fig.add_trace(go.Scatter(x=hist.index, y=ma50, mode="lines",
-                                 name="MA-50", line=dict(color="cyan", width=1.5)))
-    if show_volume and "Volume" in hist.columns:
-        colors = ["green" if row["Close"] > row["Open"] else "red" for _, row in hist.iterrows()]
-        fig.add_trace(go.Bar(
-            x=hist.index, y=hist["Volume"], name="Volume",
-            marker_color=colors, yaxis="y2", opacity=0.3
-        ))
-        fig.update_layout(yaxis2=dict(overlaying="y", side="right", showgrid=False, title="Volume"))
-    fig.update_layout(
-        title=title, yaxis_title="Price (USD)", xaxis_title="Date",
-        xaxis_rangeslider_visible=False, template="plotly_dark",
-        legend=dict(orientation="h", y=-0.25)
-    )
-    return fig
-
-# ---------- Helper: Format large numbers ----------
-def _format_number(val):
-    if val is None or (isinstance(val, float) and math.isnan(val)):
-        return "N/A"
-    try:
-        val = float(val)
-        if val >= 1e12:
-            return f"{val/1e12:.2f}T"
-        elif val >= 1e9:
-            return f"{val/1e9:.2f}B"
-        elif val >= 1e6:
-            return f"{val/1e6:.2f}M"
-        elif val >= 1e3:
-            return f"{val/1e3:.2f}K"
-        else:
-            return f"{val:.2f}"
-    except Exception:
-        return str(val)
-
-# ---------- Technical Indicators ----------
-def analyze_rsi(hist):
-    delta = hist["Close"].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss.replace(0, 1)
-    rsi = 100 - (100 / (1 + rs))
-    latest = rsi.iloc[-1]
-    if latest > 70:
-        verdict = "Overbought"
-    elif latest < 30:
-        verdict = "Oversold"
-    else:
-        verdict = "Neutral"
-    return f"RSI: {latest:.2f} ({verdict})"
-
-def analyze_ema(hist):
-    ema20 = hist["Close"].ewm(span=20, adjust=False).mean()
-    ema50 = hist["Close"].ewm(span=50, adjust=False).mean()
-    latest20, latest50 = ema20.iloc[-1], ema50.iloc[-1]
-    if latest20 > latest50:
-        verdict = "Bullish (EMA20 above EMA50)"
-    else:
-        verdict = "Bearish (EMA20 below EMA50)"
-    return f"EMA: 20-day={latest20:.2f}, 50-day={latest50:.2f} → {verdict}"
-
-def analyze_macd(hist):
-    ema12 = hist["Close"].ewm(span=12, adjust=False).mean()
-    ema26 = hist["Close"].ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    signal = macd.ewm(span=9, adjust=False).mean()
-    latest_macd, latest_signal = macd.iloc[-1], signal.iloc[-1]
-    if latest_macd > latest_signal:
-        verdict = "Bullish (MACD above Signal)"
-    else:
-        verdict = "Bearish (MACD below Signal)"
-    return f"MACD: {latest_macd:.2f} vs Signal={latest_signal:.2f} → {verdict}"
-
-# ---------- Summary builder ----------
-def _build_summary(info, ticker: str, hist):
-    return (
-        f"### {info.get('shortName', ticker)} ({ticker.upper()})\n\n"
-        f"💰 **Current Price:** {info.get('currentPrice', 'N/A')}\n"
-        f"📉 **Previous Close:** {info.get('previousClose', 'N/A')}\n\n"
-        f"🏦 **Market Cap:** {_format_number(info.get('marketCap'))}\n"
-        f"📊 **Volume:** {_format_number(info.get('volume'))}\n\n"
-        f"📈 **52W High:** {info.get('fiftyTwoWeekHigh', 'N/A')}\n"
-        f"📉 **52W Low:** {info.get('fiftyTwoWeekLow', 'N/A')}\n\n"
-        f"📊 **Indicators:**\n"
-        f"- {analyze_rsi(hist)}\n"
-        f"- {analyze_ema(hist)}\n"
-        f"- {analyze_macd(hist)}\n"
-    )
-
-# ---------- Interval chooser ----------
-def _choose_interval(view_choice: str, period_choice: str) -> str:
-    if period_choice in ["1y", "2y", "3y"]:
-        return "1d"
-    return VIEW_INTERVALS.get(view_choice, "1d")
-
-# ---------- Data fetcher ----------
-def get_stock_info(ticker: str, view_choice: str, period_choice: str,
-                   show_ma: bool, show_volume: bool):
-    interval = _choose_interval(view_choice, period_choice)
-    effective_period = period_choice or "6mo"
-
-    key = (ticker or "", view_choice, effective_period, bool(show_ma), bool(show_volume))
-    cached = _last_outputs.get(key, {"last_ts": None, "summary": "Waiting for data...",
-                                     "fig": None, "updated": "—"})
-
-    if not (ticker and ticker.strip()):
-        return cached["summary"], cached["fig"], cached["updated"]
-    try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period=effective_period, interval=interval)
-        if hist is None or hist.empty:
-            return cached["summary"], cached["fig"], cached["updated"]
-        current_last_ts = hist.index[-1]
-        if cached["last_ts"] is not None and current_last_ts == cached["last_ts"]:
-            return gr.update(), gr.update(), cached["updated"]
-
-        info = stock.info
-        summary = _build_summary(info, ticker, hist)
-
-        title = f"{ticker.upper()} — {view_choice} view over {effective_period} (interval={interval})"
-        fig = _build_chart(hist, show_ma, show_volume, title)
-        updated = datetime.datetime.now().strftime("Last updated: %Y-%m-%d %H:%M:%S")
-
-        _last_outputs[key] = {"last_ts": current_last_ts,
-                              "summary": summary, "fig": fig, "updated": updated}
-        return summary, fig, updated
-    except Exception:
-        return cached["summary"], cached["fig"], cached["updated"]
-
-# ---------- Chatbot ----------
-def stock_chat(message, history):
-    try:
-        messages = [{"role": "system",
-                     "content": "You are a helpful financial assistant. Answer questions about stocks clearly."}]
-
-        # history is already a list of {"role": ..., "content": ...}
-        messages.extend(history)
-
-        # add the latest user message
-        messages.append({"role": "user", "content": message})
-
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages
-        )
-        return resp.choices[0].message.content
-    except Exception as e:
-        return f"Error: {str(e)}"
+DEFAULT_TICKER = "AAPL"
+LATEST_CONTEXT = {"ticker": DEFAULT_TICKER}
 
 
-# ---------- UI Builder ----------
+def run_analysis(ticker_dd, ticker_txt, period, interval):
+    ticker = (ticker_txt or "").strip().upper() or (ticker_dd or DEFAULT_TICKER)
+    fig, card_html, ctx = analyze_ticker(ticker, period=period, interval=interval)
+    global LATEST_CONTEXT
+    LATEST_CONTEXT = ctx or {"ticker": ticker}
+    return fig, card_html
+
+
+def chat_reply(message, history):
+    """
+    Conversational, beginner-friendly helper.
+    Uses OpenAI if available; otherwise a simple on-device explainer.
+    """
+    ctx = LATEST_CONTEXT or {}
+    t = ctx.get("ticker", "?")
+
+    if _client:
+        # Rich prompt for conversation
+        fibs = ctx.get("fibs", {})
+        fib_str = ", ".join([f"{k}: ${v:.2f}" for k, v in fibs.items()]) if fibs else "None"
+        poc = f"${ctx['poc']:.2f}" if ctx.get("poc") else "None"
+
+        prompt = f"""
+You are a friendly stock-analysis educator. Keep it simple and helpful.
+
+Ticker: {t}
+Price: ${ctx.get('price')}
+Trend: {ctx.get('trend')}
+RSI: {ctx.get('rsi')}
+MACD: {ctx.get('macd')} vs Signal {ctx.get('macd_signal')}
+POC (Most-traded price): {poc}
+Fibonacci levels: {fibs and fib_str or 'None'}
+
+User message: {message}
+
+Rules:
+- Explain terms briefly first (as if to a beginner), then relate them to this chart's numbers.
+- You can discuss tradeoffs and what traders might *watch for*, but do NOT give personal financial advice.
+- If asked for “how many shares to buy” or similar, explain position sizing concepts (risk per trade, ATR/stop), not directives.
+- Be conversational and concise.
+"""
+        try:
+            resp = _client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are a friendly financial educator."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.4,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception:
+            pass  # fall through to offline mode
+
+    # Offline fallback (no API key): still be helpful using context
+    txt = [f"You're asking about **{t}**."]
+    p = ctx.get("price")
+    if p is not None: txt.append(f"- Latest price: **${p:.2f}**.")
+    tr = ctx.get("trend")
+    if tr: txt.append(f"- Trend: **{tr}** (20/50-day averages).")
+    m, s = ctx.get("macd"), ctx.get("macd_signal")
+    if (m is not None) and (s is not None):
+        bias = "above" if m > s else "below"
+        txt.append(f"- MACD line is **{bias}** its signal ({m:.2f} vs {s:.2f}).")
+    r = ctx.get("rsi")
+    if r is not None:
+        zone = "hot/overbought" if r >= 70 else "cool/oversold" if r <= 30 else "normal"
+        txt.append(f"- RSI: **{r:.1f}** ({zone}).")
+    if ctx.get("poc") is not None:
+        txt.append(f"- Most-traded price (POC): ~${ctx['poc']:.2f}.")
+    f = ctx.get("fibs", {});
+    imp = [k for k in ("38%", "50%", "62%", "61%") if k in f]
+    if imp:
+        txt.append("- Fibonacci zones: " + ", ".join([f"{k} ≈ ${f[k]:.2f}" for k in imp]))
+    txt.append(
+        "\nI'm running in offline mode (no model connected), so this is a quick summary. Add your OpenAI key to get conversational replies.")
+    return "\n".join(txt)
+
+
 def build_ui():
-    with gr.Blocks(title="AgenticStonks Dashboard") as demo:
-        gr.Markdown("# 📈 AgenticStonks Dashboard")
+    with gr.Blocks(
+            title="Agentic-Stonks",
+            theme=gr.themes.Soft(primary_hue="orange", neutral_hue="gray"),
+            css="""
+            /* Theme adaptive colors */
+            :root {
+                --bg-light: #f9f9fb;
+                --text-light: #000;
+                --panel-light: #fff;
+                --muted-light: #555;
 
-        with gr.Row():   # Side-by-side layout
-            # ----- LEFT: Stock Viewer -----
-            with gr.Column(scale=2):
+                --bg-dark: #0b0c10;
+                --text-dark: #eaeaea;
+                --panel-dark: #13151a;
+                --muted-dark: #a1a1a1;
+            }
+                .logo-box,.logo-box img {
+                    max-width: 120px !important;
+                    height: auto !important;
+                    background: transparent !important;
+            }
+
+
+            @media (prefers-color-scheme: dark) {
+                :root {
+                    --bg: var(--bg-dark);
+                    --text: var(--text-dark);
+                    --panel: var(--panel-dark);
+                    --muted: var(--muted-dark);
+                }
+            }
+
+            @media (prefers-color-scheme: light) {
+                :root {
+                    --bg: var(--bg-light);
+                    --text: var(--text-light);
+                    --panel: var(--panel-light);
+                    --muted: var(--muted-light);
+                }
+            }
+
+            body, .gradio-container {
+                background: var(--bg) !important;
+                color: var(--text);
+            }
+
+            .header { font-size: 1.6rem; font-weight: 700; margin: 12px 0 4px; color: var(--text); }
+            .subtext { font-size: .95rem; color: var(--muted); margin-bottom: 12px; }
+            .insight { background: var(--panel); border: 1px solid #2223; border-radius: 12px; padding: 10px 12px; color: var(--text); }
+            .insight > summary { cursor: pointer; font-weight: 700; margin-bottom: 8px; }
+            .i-row { display:flex; justify-content:space-between; gap: 16px; padding: 6px 0; border-bottom: 1px dashed #2a2a2a44;}
+            .i-row:last-child { border-bottom: none; }
+            .i-foot { color: var(--muted); font-size: .9rem; margin-top: 8px; }
+            .plotly-graph-div { height: 650px !important; }
+            .chatbot { border-radius: 10px; border: 1px solid #2223; background: var(--panel); color: var(--text); }
+            .footer { color: var(--muted); font-size: .85rem; text-align:center; margin: 14px 0 6px; }
+        """
+    ) as demo:
+
+        with gr.Row():
+            gr.Image(
+                value="images/Agentic_Stonks.png",
+                show_label=False,
+                elem_id="logo",
+                elem_classes=["logo-box"]
+            )
+            gr.HTML("<div class='header'>"
+                    "<span>Agentic-Stonks — Explain, Advise, Interpret</span>"
+                    "<div class='subtext'>Educational use only. Not financial advice.</div>"
+                    "</div>")
+
+
+        with gr.Row(equal_height=True):
+            # Left column: controls, chart, insight card
+            with gr.Column(scale=6):
                 with gr.Row():
-                    ticker_dropdown = gr.Dropdown(
-                        label="Select Stock Symbol (Quick Picks)",
-                        choices=["AAPL", "TSLA", "MSFT", "AMZN", "GOOG", "META", "NVDA"],
-                        value="AAPL"
-                    )
-                    ticker_textbox = gr.Textbox(
-                        label="Or type your own ticker",
-                        placeholder="e.g. AMD, SPY, NFLX",
-                        value="",
-                    )
+                    ticker_dd = gr.Dropdown(label="Choose stock",
+                                            choices=["AAPL", "TSLA", "MSFT", "AMZN", "GOOG", "META", "NVDA", "NFLX",
+                                                     "SPY", "QQQ", "KO", "AMD"],
+                                            value=DEFAULT_TICKER, scale=2)
+                    ticker_txt = gr.Textbox(label="Or type symbol", placeholder="e.g. AMD, BTC-USD", scale=2)
+                    period = gr.Dropdown(label="Period",
+                                         choices=["1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"], value="1y",
+                                         scale=1)
+                    interval = gr.Dropdown(label="Interval",
+                                           choices=["1d", "1h", "30m", "15m", "5m", "1m"], value="1d", scale=1)
+                    run_btn = gr.Button("Analyze", variant="primary")
 
-                view_choice = gr.Radio(label="View Type", choices=["Daily", "Weekly"], value="Daily")
-                period_choice = gr.Radio(label="Time Frame", choices=ALLOWED_PERIODS, value="6mo")
-                show_ma = gr.Checkbox(label="Show MA-20 / MA-50", value=True)
-                show_volume = gr.Checkbox(label="Show Volume Bars", value=True)
+                chart = gr.Plot(label="Chart (Price + EMA/BB + Volume Profile • MACD • RSI • Volume)")
+                insight = gr.HTML()
 
-                # preload
-                default_summary, default_chart, default_updated = get_stock_info("AAPL", "Daily", "6mo", True, True)
-                stock_output = gr.Markdown(value=default_summary)
-                stock_chart = gr.Plot(value=default_chart)
-                last_updated = gr.Markdown(value=default_updated)
-
-                def _inputs_for(fn):
-                    return dict(
-                        fn=fn,
-                        inputs=[ticker_dropdown, view_choice, period_choice, show_ma, show_volume],
-                        outputs=[stock_output, stock_chart, last_updated]
-                    )
-
-                ticker_dropdown.change(**_inputs_for(get_stock_info))
-                ticker_textbox.change(
-                    fn=lambda text_val, *rest: get_stock_info(
-                        text_val.strip().upper() if text_val.strip() else ticker_dropdown.value, *rest
-                    ),
-                    inputs=[ticker_textbox, view_choice, period_choice, show_ma, show_volume],
-                    outputs=[stock_output, stock_chart, last_updated]
-                )
-                view_choice.change(**_inputs_for(get_stock_info))
-                period_choice.change(**_inputs_for(get_stock_info))
-                show_ma.change(**_inputs_for(get_stock_info))
-                show_volume.change(**_inputs_for(get_stock_info))
-
-                gr.Timer(30.0).tick(
-                    fn=lambda *a: get_stock_info(*a),
-                    inputs=[ticker_dropdown, ticker_textbox, view_choice, period_choice, show_ma, show_volume],
-                    outputs=[stock_output, stock_chart, last_updated]
-                )
-
-            # ----- RIGHT: Chatbox -----
-            with gr.Column(scale=1):
+            # Right column: conversational AI
+            with gr.Column(scale=4):
+                gr.Markdown("### 💬 Ask the AI about the chart below:")
                 gr.ChatInterface(
-                    fn=stock_chat,
+                    fn=chat_reply,
                     type="messages",
-                    title="💬 Stonk Assistant",
-                    description="Ask me questions about stocks while watching the chart!"
+                    chatbot=gr.Chatbot(height=520, elem_classes=["chatbot"]),
+                    examples=["What does MACD mean here?",
+                              "Where is the strongest support?",
+                              "Is RSI telling me it's overheated?"]
                 )
+
+        # Wiring
+        run_btn.click(run_analysis, [ticker_dd, ticker_txt, period, interval], [chart, insight])
+        ticker_dd.change(run_analysis, [ticker_dd, ticker_txt, period, interval], [chart, insight])
+        ticker_txt.submit(run_analysis, [ticker_dd, ticker_txt, period, interval], [chart, insight])
+
+        # Initial content
+        fig, card = run_analysis(DEFAULT_TICKER, "", "1y", "1d")
+        chart.value, insight.value = fig, card
+
+        gr.HTML("<div class='footer'>© Agentic-Stonks · Educational only · Built with Gradio</div>")
 
     return demo
 
-# ---------- Entry Point ----------
+
 if __name__ == "__main__":
-    demo = build_ui()
-    demo.launch(server_name="127.0.0.1", server_port=7860)
+    ui = build_ui()
+    ui.launch(server_name="127.0.0.1", server_port=7861)
