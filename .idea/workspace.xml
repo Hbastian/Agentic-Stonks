@@ -4,7 +4,9 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="398b3f9b-06c3-49bf-865a-4177dc30f71b" name="Changes" comment="Adding all the updated files to my branch" />
+    <list default="true" id="398b3f9b-06c3-49bf-865a-4177dc30f71b" name="Changes" comment="Adding all the updated files to my branch">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -122,6 +124,7 @@
       <workItem from="1760909832010" duration="7234000" />
       <workItem from="1760923280505" duration="17673000" />
       <workItem from="1760992711401" duration="71000" />
+      <workItem from="1760999319259" duration="3191000" />
     </task>
     <task id="LOCAL-00001" summary="LOGO">
       <option name="closed" value="true" />
@@ -155,7 +158,15 @@
       <option name="project" value="LOCAL" />
       <updated>1760992106047</updated>
     </task>
-    <option name="localTasksCounter" value="5" />
+    <task id="LOCAL-00005" summary="Adding all the updated files to my branch">
+      <option name="closed" value="true" />
+      <created>1760999391177</created>
+      <option name="number" value="00005" />
+      <option name="presentableId" value="LOCAL-00005" />
+      <option name="project" value="LOCAL" />
+      <updated>1760999391177</updated>
+    </task>
+    <option name="localTasksCounter" value="6" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -172,7 +183,7 @@
                   <entry key="branch">
                     <value>
                       <list>
-                        <option value="stonks-copy" />
+                        <option value="Darius" />
                       </list>
                     </value>
                   </entry>
