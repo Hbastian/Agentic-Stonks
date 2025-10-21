@@ -1,235 +1,283 @@
-# analysis.py — v2 (dark UI, volume profile, fibs, Insight Card HTML)
+# analysis.py
+# Data fetch, indicator calculations, chart construction, and a compact summary for chat.
+
 from __future__ import annotations
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import plotly.graph_objs as go
-from dataclasses import dataclass
+from typing import Literal, Tuple, Dict, Any
 
-# ----------------------------
-# Data fetch
-# ----------------------------
-def fetch_ohlcv(ticker: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
-    t = yf.Ticker(ticker)
-    df = t.history(period=period, interval=interval, auto_adjust=False)
-    if df is None or df.empty:
-        return pd.DataFrame()
-    df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
-    df.dropna(inplace=True)
+# -------------------------- Data --------------------------
+
+def _fetch(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    df = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False)
+
+    # Robust empty-frame handling
+    empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+        return empty
+
+    # normalize potential MultiIndex columns
+    if isinstance(df.columns, pd.MultiIndex):
+        try:
+            df = df.droplevel(1, axis=1)
+        except Exception:
+            pass
+
+    # normalize names, guard for missing OHLC
+    df = df.rename(columns=lambda c: str(c).strip().title())
+    needed = {"Open", "High", "Low", "Close"}
+    if not needed.issubset(set(df.columns)):
+        return empty
+
+    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+    if "Volume" not in df.columns:
+        df["Volume"] = 0
     return df
 
-# ----------------------------
-# Indicators
-# ----------------------------
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def fetch_ohlcv(symbol: str, timeframe: Literal["1h", "4h", "1d"]) -> Tuple[pd.DataFrame, str, str]:
+    """
+    Returns (df, period, interval_used).
+    4h is created by fetching 1h and resampling to 4h OHLCV.
+    """
+    if timeframe == "1h":
+        period, interval = "1mo", "1h"
+        df = _fetch(symbol, period, interval)
+    elif timeframe == "4h":
+        period, interval = "3mo", "1h"
+        base = _fetch(symbol, period, interval)
+        if base.empty:
+            return base, period, "4h"
+        # Resample to 4h
+        o = base["Open"].resample("4H").first()
+        h = base["High"].resample("4H").max()
+        l = base["Low"].resample("4H").min()
+        c = base["Close"].resample("4H").last()
+        v = base["Volume"].resample("4H").sum()
+        df = pd.DataFrame({"Open": o, "High": h, "Low": l, "Close": c, "Volume": v}).dropna()
+        interval = "4h"
+    else:  # "1d"
+        period, interval = "1y", "1d"
+        df = _fetch(symbol, period, interval)
+    return df, period, interval
+
+# ----------------------- Indicators -----------------------
+
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+def true_range(df: pd.DataFrame) -> pd.Series:
+    prev_close = df["Close"].shift(1)
+    tr1 = df["High"] - df["Low"]
+    tr2 = (df["High"] - prev_close).abs()
+    tr3 = (df["Low"] - prev_close).abs()
+    return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    tr = true_range(df)
+    # Wilder's ATR approximated via EMA(alpha=1/n)
+    return tr.ewm(alpha=1.0 / n, adjust=False).mean()
+
+def session_vwap(df: pd.DataFrame) -> pd.Series:
+    """VWAP that resets each trading day (use on intraday)."""
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
+    vol = df["Volume"]
+    key = pd.Series(df.index.date, index=df.index)
+    cum_pv = (tp * vol).groupby(key).cumsum()
+    cum_v  = vol.groupby(key).cumsum().replace(0, np.nan)
+    return (cum_pv / cum_v).rename("VWAP")
+
+def rolling_vwap(df: pd.DataFrame, n: int = 20) -> pd.Series:
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
+    pv = tp * df["Volume"]
+    roll_pv = pv.rolling(n, min_periods=1).sum()
+    roll_v  = df["Volume"].rolling(n, min_periods=1).sum().replace(0, np.nan)
+    return (roll_pv / roll_v).rename("VWAP")
+
+def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    ema_fast = ema(series, fast)
+    ema_slow = ema(series, slow)
+    line = ema_fast - ema_slow
+    sig = ema(line, signal)
+    hist = line - sig
+    return line.rename("MACD"), sig.rename("Signal"), hist.rename("MACD_Hist")
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+def compute_indicators(
+    df: pd.DataFrame,
+    *,
+    want_ema200: bool = True,
+    want_atr: bool = True,
+    vwap_mode: Literal["session", "anchored", "rolling"] = "session",
+    vwap_n: int = 20,
+    want_vtvr: bool = True,
+    vtvr_use_tr: bool = False,  # False => use ATR(14); True => use single-bar TR
+    vtvr_z_on: bool = False,
+    vtvr_z_window: int = 60,
+    ensure_macd_rsi: bool = True
+) -> pd.DataFrame:
+    if df.empty:
+        return df
+
     out = df.copy()
-    # EMAs
-    out["EMA20"]  = out["Close"].ewm(span=20, adjust=False).mean()
-    out["EMA50"]  = out["Close"].ewm(span=50, adjust=False).mean()
-    out["EMA200"] = out["Close"].ewm(span=200, adjust=False).mean()
 
-    # Bollinger (20,2)
-    ma20  = out["Close"].rolling(20).mean()
-    std20 = out["Close"].rolling(20).std(ddof=0)
-    out["BB_upper"] = ma20 + 2 * std20
-    out["BB_lower"] = ma20 - 2 * std20
+    # Baseline momentum (keeps figure resilient)
+    if ensure_macd_rsi:
+        if "MACD" not in out.columns or "Signal" not in out.columns:
+            m, s, h = macd(out["Close"])
+            out["MACD"], out["Signal"], out["MACD_Hist"] = m, s, h
+        if "RSI" not in out.columns:
+            out["RSI"] = rsi(out["Close"])
 
-    # MACD (12,26,9)
-    ema12 = out["Close"].ewm(span=12, adjust=False).mean()
-    ema26 = out["Close"].ewm(span=26, adjust=False).mean()
-    out["MACD"]        = ema12 - ema26
-    out["MACD_signal"] = out["MACD"].ewm(span=9, adjust=False).mean()
-    out["MACD_hist"]   = out["MACD"] - out["MACD_signal"]
+    if want_ema200:
+        out["EMA200"] = ema(out["Close"], 200)
 
-    # Cross flag
-    pm, ps = out["MACD"].shift(1), out["MACD_signal"].shift(1)
-    out["MACD_cross"] = np.where(
-        (pm < ps) & (out["MACD"] > out["MACD_signal"]), "Bullish",
-        np.where((pm > ps) & (out["MACD"] < out["MACD_signal"]), "Bearish", "")
-    )
+    if want_atr:
+        out["ATR14"] = atr(out, 14)
 
-    # RSI(14) (Wilder)
-    d = out["Close"].diff()
-    up = d.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
-    dn = (-d.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
-    rs = up / dn.replace(0, np.nan)
-    out["RSI"] = 100 - (100 / (1 + rs))
-    out["RSI_state"] = pd.cut(out["RSI"], [-np.inf, 30, 70, np.inf],
-                              labels=["Oversold", "Neutral", "Overbought"])
+    # VWAP
+    if vwap_mode == "session":
+        try:
+            out["VWAP"] = session_vwap(out)
+        except Exception:
+            out["VWAP"] = rolling_vwap(out, max(5, min(50, vwap_n)))
+    elif vwap_mode == "rolling":
+        out["VWAP"] = rolling_vwap(out, vwap_n)
+    else:  # anchored -> fallback to rolling unless an anchor is supplied externally
+        out["VWAP"] = rolling_vwap(out, vwap_n)
 
-    # Regime
-    out["Trend"] = np.where(out["EMA20"] > out["EMA50"], "Uptrend",
-                     np.where(out["EMA20"] < out["EMA50"], "Downtrend", "Range"))
+    # VTVR (Volume to Volatility Ratio)
+    if want_vtvr:
+        denom = true_range(out) if vtvr_use_tr else out.get("ATR14", atr(out, 14))
+        denom = denom.replace(0, np.nan)
+        out["VTVR"] = (out["Volume"] / denom).rename("VTVR")
+        if vtvr_z_on:
+            mean = out["VTVR"].rolling(vtvr_z_window, min_periods=10).mean()
+            std = out["VTVR"].rolling(vtvr_z_window, min_periods=10).std()
+            out["VTVR_z"] = (out["VTVR"] - mean) / std
+
     return out
 
-# ----------------------------
-# Volume profile (horizontal by price)
-# ----------------------------
-def compute_volume_profile(df: pd.DataFrame, bins: int = 40):
-    if df.empty:
-        return None
-    lo, hi = float(df["Low"].min()), float(df["High"].max())
-    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-        return None
-    prices = df["Close"].to_numpy()
-    vols   = df["Volume"].to_numpy()
-    counts, edges = np.histogram(prices, bins=bins, range=(lo, hi), weights=vols)
-    centers = (edges[:-1] + edges[1:]) / 2.0
-    return {
-        "price_centers": centers,
-        "volume": counts,
-        "poc_price": centers[np.argmax(counts)] if np.any(counts) else np.nan
-    }
+# ---------------- Chat snapshot for the bot ---------------
 
-# ----------------------------
-# Fibonacci retracement (recent swing)
-# ----------------------------
-def compute_fibs(df: pd.DataFrame, lookback: int = 120):
-    if df.empty:
-        return {}
-    sub = df.tail(lookback) if len(df) > lookback else df
-    hi, lo = float(sub["High"].max()), float(sub["Low"].min())
-    if not np.isfinite(hi) or not np.isfinite(lo) or hi == lo:
-        return {}
-    levels = [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0]
-    fibs = {f"{int(l*100)}%": hi - (hi - lo)*l for l in levels}
-    return {"high": hi, "low": lo, "levels": fibs}
-
-# ----------------------------
-# Risk metrics
-# ----------------------------
-@dataclass
-class RiskCard:
-    cagr: float
-    volatility: float
-    sharpe: float
-    sortino: float
-    max_drawdown: float
-
-def compute_risk(df: pd.DataFrame, window: int = 252) -> RiskCard:
-    if df.empty or len(df) < max(30, window // 4):
-        return RiskCard(np.nan, np.nan, np.nan, np.nan, np.nan)
-    px = df["Close"]
-    r  = px.pct_change().dropna()
-    ann = np.sqrt(252)
-    p0, p1 = px.iloc[-min(window, len(px))], px.iloc[-1]
-    cagr = (p1/p0)**(252/min(window, len(px))) - 1
-    vol = r.std()*ann
-    mean_ann = r.mean()*252
-    sharpe  = mean_ann/vol if vol else np.nan
-    dn = r[r<0]; sortino = mean_ann/(dn.std()*ann) if len(dn)>0 else np.nan
-    mdd = (px/px.cummax() - 1).min()
-    return RiskCard(cagr, vol, sharpe, sortino, mdd)
-
-def _pct(x):  return f"{x*100:.2f}%" if np.isfinite(x) else "—"
-def _fmt(x):  return f"{x:.2f}" if np.isfinite(x) else "—"
-
-# ----------------------------
-# Insight Card (HTML)
-# ----------------------------
-def insight_html(df: pd.DataFrame, risk: RiskCard, profile: dict, fibs: dict) -> str:
+def make_chat_snapshot(df: pd.DataFrame) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    if df is None or df.empty:
+        return out
     last = df.iloc[-1]
-    poc_html = f"<div><b>POC</b>: ${profile['poc_price']:.2f}</div>" if profile and np.isfinite(profile.get("poc_price", np.nan)) else ""
-    fib_html = ""
-    if fibs and "levels" in fibs:
-        keep = [k for k in ("38%","50%","62%","61%") if k in fibs["levels"]]
-        if keep:
-            fib_html = "<div><b>Fibs</b>: " + ", ".join([f"{k} ≈ ${fibs['levels'][k]:.2f}" for k in keep]) + "</div>"
 
-    return f"""
-<details open class="insight">
-  <summary>📊 Insight Card</summary>
-  <div class="i-row"><span>📈 <b>Trend</b></span><span>{last['Trend']} (EMA20 {last['EMA20']:.2f} vs EMA50 {last['EMA50']:.2f})</span></div>
-  <div class="i-row"><span>⚡ <b>Momentum (MACD)</b></span><span>{last['MACD']:.2f} vs {last['MACD_signal']:.2f} (hist {'pos' if last['MACD_hist']>0 else 'neg'})</span></div>
-  <div class="i-row"><span>💧 <b>RSI</b></span><span>{last['RSI']:.1f} → {str(last['RSI_state'])}</span></div>
-  {f'<div class="i-row"><span>🎯 <b>Volume Profile</b></span><span>{poc_html}</span></div>' if poc_html else ''}
-  {f'<div class="i-row"><span>📐 <b>Retracements</b></span><span>{fib_html}</span></div>' if fib_html else ''}
-  <div class="i-row"><span>🛡 <b>Risk (~1y)</b></span>
-      <span>Sharpe {_fmt(risk.sharpe)} · Sortino {_fmt(risk.sortino)} · Vol {_pct(risk.volatility)} · MaxDD {_pct(risk.max_drawdown)} · CAGR {_pct(risk.cagr)}</span>
-  </div>
-  <div class="i-foot">Simple reading: Trend = direction, MACD = momentum, RSI = “hot/cold”, POC/Fibs = likely pause or bounce zones.</div>
-</details>
-"""
+    def g(col):
+        return float(last[col]) if col in df.columns and pd.notna(last[col]) else None
 
-# ----------------------------
-# Plotly figure (dark)
-# ----------------------------
-def make_figure(df: pd.DataFrame, profile: dict, fibs: dict) -> go.Figure:
-    fig = go.Figure()
-    # Price panel
-    for tr in [
-        go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Price"),
-        go.Scatter(x=df.index, y=df["EMA20"],  name="EMA20",  mode="lines"),
-        go.Scatter(x=df.index, y=df["EMA50"],  name="EMA50",  mode="lines"),
-        go.Scatter(x=df.index, y=df["BB_upper"], name="BB Upper", mode="lines"),
-        go.Scatter(x=df.index, y=df["BB_lower"], name="BB Lower", mode="lines"),
-    ]: fig.add_trace(tr)
+    out["last_close"]   = round(g("Close"), 2) if g("Close") is not None else None
+    out["last_ema200"]  = round(g("EMA200"), 2) if g("EMA200") is not None else None
+    out["last_atr14"]   = round(g("ATR14"), 2) if g("ATR14") is not None else None
+    out["last_vwap"]    = round(g("VWAP"), 2) if g("VWAP") is not None else None
+    out["last_rsi"]     = round(g("RSI"), 2) if g("RSI") is not None else None
+    out["last_macd"]    = round(g("MACD"), 2) if g("MACD") is not None else None
+    out["last_signal"]  = round(g("Signal"), 2) if g("Signal") is not None else None
+    out["last_vtvr"]    = round(g("VTVR"), 2) if g("VTVR") is not None else None
+    out["last_vtvr_z"]  = round(g("VTVR_z"), 2) if g("VTVR_z") is not None else None
 
-    # Fibs
-    if fibs and "levels" in fibs:
-        for label, y in fibs["levels"].items():
-            fig.add_hline(y=y, line_dash="dot", line_width=1,
-                          annotation_text=f"Fib {label}", annotation_position="right")
+    notes = []
+    if out["last_close"] is not None and out["last_ema200"] is not None:
+        if out["last_close"] > out["last_ema200"]:
+            notes.append("Price above EMA200 (long-term up-bias).")
+        elif out["last_close"] < out["last_ema200"]:
+            notes.append("Price below EMA200 (long-term down-bias).")
 
-    # Volume Profile (right rail)
-    if profile:
-        fig.add_trace(go.Bar(
-            x=profile["volume"], y=profile["price_centers"],
-            orientation="h", name="Volume Profile", opacity=0.5,
-            xaxis="x5", yaxis="y", showlegend=False
-        ))
-        if np.isfinite(profile.get("poc_price", np.nan)):
-            fig.add_hline(y=profile["poc_price"], line_color="orange", line_width=2,
-                          annotation_text="POC", annotation_position="right")
+    if out["last_rsi"] is not None:
+        if out["last_rsi"] >= 70:
+            notes.append("RSI overbought zone (≥70).")
+        elif out["last_rsi"] <= 30:
+            notes.append("RSI oversold zone (≤30).")
 
-    # MACD / RSI / Volume
-    for tr in [
-        go.Scatter(x=df.index, y=df["MACD"], name="MACD", xaxis="x2", yaxis="y2"),
-        go.Scatter(x=df.index, y=df["MACD_signal"], name="Signal", xaxis="x2", yaxis="y2"),
-        go.Bar(x=df.index, y=df["MACD_hist"], name="Hist", xaxis="x2", yaxis="y2", opacity=0.6),
-        go.Scatter(x=df.index, y=df["RSI"], name="RSI(14)", xaxis="x3", yaxis="y3"),
-        go.Bar(x=df.index, y=df["Volume"], name="Volume", xaxis="x4", yaxis="y4"),
-    ]: fig.add_trace(tr)
+    if out["last_macd"] is not None and out["last_signal"] is not None:
+        if out["last_macd"] > out["last_signal"]:
+            notes.append("MACD above Signal (bullish momentum).")
+        elif out["last_macd"] < out["last_signal"]:
+            notes.append("MACD below Signal (bearish momentum).")
+
+    out["notes"] = notes
+    return out
+
+# ----------------------- Plotly Figure --------------------
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+def make_figure(
+    df: pd.DataFrame,
+    *,
+    show_ema200: bool = True,
+    show_atr: bool = True,
+    show_vwap: bool = True,
+    show_vtvr: bool = True,
+    show_vtvr_z: bool = False,
+):
+    if df is None or df.empty:
+        fig = go.Figure()
+        fig.update_layout(title="No data", height=900)
+        return fig
+
+    fig = make_subplots(
+        rows=5, cols=1,
+        specs=[
+            [{"secondary_y": False}],  # Price
+            [{"secondary_y": False}],  # MACD
+            [{"secondary_y": False}],  # RSI
+            [{"secondary_y": True}],   # Volume + VTVR_z
+            [{"secondary_y": False}],  # ATR
+        ],
+        row_heights=[0.54, 0.12, 0.12, 0.12, 0.10],
+    )
+
+    # 1) Price
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+        name="Price", showlegend=False
+    ), row=1, col=1)
+
+    if show_ema200 and "EMA200" in df:
+        fig.add_trace(go.Scatter(x=df.index, y=df["EMA200"], name="EMA200", mode="lines"), row=1, col=1)
+
+    if show_vwap and "VWAP" in df:
+        fig.add_trace(go.Scatter(x=df.index, y=df["VWAP"], name="VWAP", mode="lines"), row=1, col=1)
+
+    # 2) MACD
+    if "MACD" in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df["MACD"], name="MACD", mode="lines"), row=2, col=1)
+    if "Signal" in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df["Signal"], name="Signal", mode="lines"), row=2, col=1)
+
+    # 3) RSI
+    if "RSI" in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI", mode="lines"), row=3, col=1)
+        fig.update_yaxes(range=[0, 100], row=3, col=1)
+
+    # 4) Volume + optional VTVR_z
+    if "Volume" in df.columns:
+        fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume", opacity=0.5), row=4, col=1, secondary_y=False)
+    if show_vtvr and show_vtvr_z and "VTVR_z" in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df["VTVR_z"], name="VTVR_z", mode="lines"),
+                      row=4, col=1, secondary_y=True)
+        fig.update_yaxes(title_text="Volume", row=4, col=1, secondary_y=False)
+        fig.update_yaxes(title_text="VTVR_z", row=4, col=1, secondary_y=True)
+
+    # 5) ATR
+    if show_atr and "ATR14" in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df["ATR14"], name="ATR(14)", mode="lines"), row=5, col=1)
 
     fig.update_layout(
-        height=700, template="plotly_dark", hovermode="x unified",
-        margin=dict(l=40, r=20, t=40, b=40),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        xaxis=dict(domain=[0.0, 0.80]),
-        yaxis=dict(domain=[0.58, 1.0], title="Price"),
-        xaxis5=dict(domain=[0.82, 1.0], showticklabels=False),
-        xaxis2=dict(domain=[0,1], anchor="y2"),
-        yaxis2=dict(domain=[0.40,0.56], title="MACD"),
-        xaxis3=dict(domain=[0,1], anchor="y3"),
-        yaxis3=dict(domain=[0.24,0.38], title="RSI", range=[0,100]),
-        xaxis4=dict(domain=[0,1], anchor="y4"),
-        yaxis4=dict(domain=[0,0.22], title="Volume"),
+        height=900,
+        margin=dict(l=40, r=20, t=40, b=30),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
-    fig.add_hrect(yref="y3", y0=70, y1=100, line_width=0, fillcolor="rgba(200,50,50,0.08)")
-    fig.add_hrect(yref="y3", y0=0,  y1=30,  line_width=0, fillcolor="rgba(50,200,50,0.08)")
     return fig
-
-# ----------------------------
-# Public API
-# ----------------------------
-def analyze_ticker(ticker: str, period="1y", interval="1d"):
-    df = fetch_ohlcv(ticker, period, interval)
-    if df.empty:
-        return None, "<div class='i-foot'>No data for ticker.</div>", {}
-    df = compute_indicators(df)
-    profile = compute_volume_profile(df, bins=40)
-    fibs    = compute_fibs(df, lookback=120)
-    risk    = compute_risk(df)
-    fig     = make_figure(df, profile, fibs)
-    card    = insight_html(df, risk, profile, fibs)
-    context = {
-        "ticker": ticker,
-        "price": float(df["Close"].iloc[-1]),
-        "trend": str(df["Trend"].iloc[-1]),
-        "rsi": float(df["RSI"].iloc[-1]),
-        "macd": float(df["MACD"].iloc[-1]),
-        "macd_signal": float(df["MACD_signal"].iloc[-1]),
-        "poc": float(profile["poc_price"]) if profile and np.isfinite(profile.get("poc_price", np.nan)) else None,
-        "fibs": fibs.get("levels", {}) if fibs else {},
-    }
-    return fig, card, context
