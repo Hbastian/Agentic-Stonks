@@ -356,21 +356,27 @@ def build_ui():
     .primary:hover {
         background: linear-gradient(135deg, #2563eb, #1d4ed8) !important;
     }
+     .logo-box,.logo-box img {
+                    max-width: 120px !important;
+                    height: auto !important;
+                    background: transparent !important;
+            }
+
     """
 
     with gr.Blocks(title="Agentic-Stonks", theme=theme, css=css) as demo:
         # Header with blue accent
         with gr.Row():
-            with gr.Column():
-                gr.HTML("""
-                <div class="header-bar">
-                  <div class="app-dot"></div>
-                  <div class="header-title">
-                    📈 Agentic-Stonks — <span class="header-subtitle">Explain, Advise, Interpret</span>
-                  </div>
-                  <div class="badge">Educational use only. Not financial advice.</div>
-                </div>
-                """)
+            gr.Image(
+                value="images/Agentic_Stonks.png",
+                show_label=False,
+                elem_id="logo",
+                elem_classes=["logo-box"]
+            )
+            gr.HTML("<div class='header'>"
+                    "<span>Agentic-Stonks — Explain, Advise, Interpret</span>"
+                    "<div class='subtext'>Educational use only. Not financial advice.</div>"
+                    "</div>")
 
         analysis_context = gr.State(value={"ok": False})
         chat_fn.analysis_context = analysis_context
