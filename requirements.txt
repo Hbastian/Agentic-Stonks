@@ -1,4 +1,4 @@
-# run pip install -r requirements.txt or python -m pip install -r requirements or python3 -m pip install -r requirements to get the following
+# run pip install -r requirements.txt or python -m pip install -r requirements or python3 -m pip install -r requirements.txt to get the following
 
 # Web framework
 flask>=3.0.3

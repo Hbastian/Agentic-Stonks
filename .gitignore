@@ -1,11 +1,10 @@
-# API keys and secrets
-.env
-.env.*
-.venv/
-*.key
-*.pem
-apikey.txt
-config.properties
-secrets.json
+.DS_Store
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+.env
+.idea/
+.vscode/
