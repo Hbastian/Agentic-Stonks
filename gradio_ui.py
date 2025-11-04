@@ -1,510 +1,261 @@
-# gradio_ui.py
-from __future__ import annotations
+import gradio as gr
+import yfinance as yf
+import plotly.graph_objects as go
+import datetime
 import os
-from typing import Dict, Any, List, Tuple
-
+import math
+from typing import Dict, Any
+from openai import OpenAI
 from dotenv import load_dotenv
 
+# 🔹 Load env for local dev
 load_dotenv()
 
-import gradio as gr
-from analysis import fetch_ohlcv, compute_indicators, make_figure, make_chat_snapshot
+# ---------- OpenAI setup ----------
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-TIMEFRAME_PRESETS = {
-    "Hourly (1h)": "1h",
-    "4 Hours (4h)": "4h",
-    "Daily (1d)": "1d",
+# ---------- View to interval mapping ----------
+VIEW_INTERVALS = {
+    "Daily": "1h",   # hourly candles
+    "Weekly": "1d",  # daily candles
 }
 
-VWAP_MODES = {
-    "Session (intraday reset)": "session",
-    "Rolling Window": "rolling",
-    "Anchored* (uses rolling fallback)": "anchored",
-}
+# ---------- Allowed periods ----------
+ALLOWED_PERIODS = ["3mo", "6mo", "1y", "2y", "3y"]
 
-NAME_TO_TICKER = {
-    "APPLE": "AAPL", "AMAZON": "AMZN", "MICROSOFT": "MSFT", "META": "META",
-    "ALPHABET": "GOOGL", "GOOGLE": "GOOGL", "TESLA": "TSLA", "NVIDIA": "NVDA"
-}
+# ---------- Cache + top-of-hour guard ----------
+_last_outputs: Dict[tuple, Dict[str, Any]] = {}
+_last_top_hour_key = None  # (year, month, day, hour)
 
-# OpenAI (optional)
-try:
-    from openai import OpenAI
+# ---------- Chart builder ----------
+def _build_chart(hist, show_ma: bool, show_volume: bool, title: str):
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=hist.index, open=hist["Open"], high=hist["High"],
+        low=hist["Low"], close=hist["Close"], name="Price"
+    ))
+    if show_ma and not hist.empty:
+        ma20 = hist["Close"].rolling(window=20).mean()
+        ma50 = hist["Close"].rolling(window=50).mean()
+        fig.add_trace(go.Scatter(x=hist.index, y=ma20, mode="lines",
+                                 name="MA-20", line=dict(color="yellow", width=1.5)))
+        fig.add_trace(go.Scatter(x=hist.index, y=ma50, mode="lines",
+                                 name="MA-50", line=dict(color="cyan", width=1.5)))
+    if show_volume and "Volume" in hist.columns:
+        colors = ["green" if row["Close"] > row["Open"] else "red" for _, row in hist.iterrows()]
+        fig.add_trace(go.Bar(
+            x=hist.index, y=hist["Volume"], name="Volume",
+            marker_color=colors, yaxis="y2", opacity=0.3
+        ))
+        fig.update_layout(yaxis2=dict(overlaying="y", side="right", showgrid=False, title="Volume"))
+    fig.update_layout(
+        title=title, yaxis_title="Price (USD)", xaxis_title="Date",
+        xaxis_rangeslider_visible=False, template="plotly_dark",
+        legend=dict(orientation="h", y=-0.25)
+    )
+    return fig
 
-    if os.getenv("OPENAI_API_KEY"):
-        _client = OpenAI()
-        _OPENAI_OK = True
+# ---------- Helper: Format large numbers ----------
+def _format_number(val):
+    if val is None or (isinstance(val, float) and math.isnan(val)):
+        return "N/A"
+    try:
+        val = float(val)
+        if val >= 1e12:
+            return f"{val/1e12:.2f}T"
+        elif val >= 1e9:
+            return f"{val/1e9:.2f}B"
+        elif val >= 1e6:
+            return f"{val/1e6:.2f}M"
+        elif val >= 1e3:
+            return f"{val/1e3:.2f}K"
+        else:
+            return f"{val:.2f}"
+    except Exception:
+        return str(val)
+
+# ---------- Technical Indicators ----------
+def analyze_rsi(hist):
+    delta = hist["Close"].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss.replace(0, 1)
+    rsi = 100 - (100 / (1 + rs))
+    latest = rsi.iloc[-1]
+    if latest > 70:
+        verdict = "Overbought"
+    elif latest < 30:
+        verdict = "Oversold"
     else:
-        _OPENAI_OK = False
-        _client = None
-except Exception:
-    _OPENAI_OK = False
-    _client = None
+        verdict = "Neutral"
+    return f"RSI: {latest:.2f} ({verdict})"
 
-_SYSTEM_PROMPT = (
-    "You are a helpful stock-analysis assistant embedded in a charting app. "
-    "Provide conversational, insightful responses that explain technical indicators clearly. "
-    "Use the provided context (symbol, timeframe, toggles, last values) to give specific, actionable insights. "
-    "Be concise but thorough. Explain what the indicators suggest about the current market conditions. "
-    "Educational use only - avoid giving direct buy/sell recommendations."
-)
-
-
-def _context_to_text(ctx: Dict[str, Any]) -> str:
-    if not isinstance(ctx, dict) or not ctx.get("ok"):
-        return "Context: (no current chart loaded)"
-    lines = [
-        f"Current Analysis Context:",
-        f"Symbol: {ctx.get('symbol')}",
-        f"Timeframe: {ctx.get('timeframe')}",
-        f"Active Indicators: "
-        f"{'EMA200 ' if ctx.get('show_ema200') else ''}"
-        f"{'ATR(14) ' if ctx.get('show_atr') else ''}"
-        f"{'VWAP ' if ctx.get('show_vwap') else ''}"
-        f"{'VTVR ' if ctx.get('show_vtvr') else ''}".strip(),
-    ]
-
-    values_section = []
-    if ctx.get("last_close") is not None:
-        values_section.append(f"Last Close: ${ctx['last_close']}")
-    if ctx.get("last_ema200") is not None:
-        values_section.append(f"EMA200: ${ctx['last_ema200']}")
-    if ctx.get("last_atr14") is not None:
-        values_section.append(f"ATR(14): {ctx['last_atr14']}")
-    if ctx.get("last_vwap") is not None:
-        values_section.append(f"VWAP: ${ctx['last_vwap']}")
-    if ctx.get("last_rsi") is not None:
-        values_section.append(f"RSI: {ctx['last_rsi']}")
-    if ctx.get("last_macd") is not None and ctx.get("last_signal") is not None:
-        values_section.append(f"MACD: {ctx['last_macd']}, Signal: {ctx['last_signal']}")
-    if ctx.get("last_vtvr") is not None:
-        vtvr_str = f"VTVR: {ctx['last_vtvr']}"
-        if ctx.get("last_vtvr_z") is not None:
-            vtvr_str += f" (z-score: {ctx['last_vtvr_z']})"
-        values_section.append(vtvr_str)
-
-    if values_section:
-        lines.append("\nCurrent Values:")
-        lines.extend(values_section)
-
-    notes = ctx.get("notes", [])
-    if notes:
-        lines.append(f"\nKey Observations: {' '.join(notes)}")
-
-    return "\n".join(lines)
-
-
-# *** FIXED: Changed to return proper message format for Gradio ***
-def chat_fn(message: str, history: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """Handle chat with proper dictionary format for Gradio Chatbot with type='messages'"""
-    ctx_state = getattr(chat_fn, "analysis_context", None)
-    ctx_val = ctx_state.value if isinstance(ctx_state, gr.State) else (ctx_state or {})
-    ctx_text = _context_to_text(ctx_val)
-
-    if _OPENAI_OK:
-        try:
-            messages = [{"role": "system", "content": _SYSTEM_PROMPT + "\n\n" + ctx_text}]
-
-            # Convert history to OpenAI format
-            for msg in history:
-                if isinstance(msg, dict):
-                    messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
-
-            messages.append({"role": "user", "content": str(message)})
-
-            resp = _client.chat.completions.create(
-                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-                messages=messages,
-                temperature=0.3,
-                max_tokens=800,
-            )
-            response_text = resp.choices[0].message.content.strip()
-
-        except Exception as e:
-            response_text = f"I'm having trouble connecting to the AI service. Let me give you what I can see from the chart data.\n\n{_generate_fallback_response(ctx_val)}"
+def analyze_ema(hist):
+    ema20 = hist["Close"].ewm(span=20, adjust=False).mean()
+    ema50 = hist["Close"].ewm(span=50, adjust=False).mean()
+    latest20, latest50 = ema20.iloc[-1], ema50.iloc[-1]
+    if latest20 > latest50:
+        verdict = "Bullish (EMA20 above EMA50)"
     else:
-        response_text = _generate_fallback_response(ctx_val)
+        verdict = "Bearish (EMA20 below EMA50)"
+    return f"EMA: 20-day={latest20:.2f}, 50-day={latest50:.2f} → {verdict}"
 
-    # *** FIXED: Return proper message format ***
-    new_history = history + [
-        {"role": "user", "content": message},
-        {"role": "assistant", "content": response_text}
-    ]
-    return new_history
+def analyze_macd(hist):
+    ema12 = hist["Close"].ewm(span=12, adjust=False).mean()
+    ema26 = hist["Close"].ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    signal = macd.ewm(span=9, adjust=False).mean()
+    latest_macd, latest_signal = macd.iloc[-1], signal.iloc[-1]
+    if latest_macd > latest_signal:
+        verdict = "Bullish (MACD above Signal)"
+    else:
+        verdict = "Bearish (MACD below Signal)"
+    return f"MACD: {latest_macd:.2f} vs Signal={latest_signal:.2f} → {verdict}"
 
-
-def _generate_fallback_response(ctx_val: Dict[str, Any]) -> str:
-    """Generate intelligent fallback response when OpenAI is unavailable"""
-    if not isinstance(ctx_val, dict) or not ctx_val.get("ok"):
-        return "I don't have chart data loaded yet. Click **Analyze** first, and I'll be able to help you understand the indicators and trends."
-
-    symbol = ctx_val.get('symbol', 'the stock')
-    tf = ctx_val.get('timeframe', 'this timeframe')
-
-    response = f"Looking at **{symbol}** on the **{tf}** chart:\n\n"
-
-    # Price and trend analysis
-    if ctx_val.get("last_close") is not None:
-        response += f"**Current Price**: ${ctx_val['last_close']}\n"
-
-        if ctx_val.get("show_ema200") and ctx_val.get("last_ema200") is not None:
-            if ctx_val["last_close"] > ctx_val["last_ema200"]:
-                diff_pct = ((ctx_val["last_close"] - ctx_val["last_ema200"]) / ctx_val["last_ema200"] * 100)
-                response += f"The price is **{diff_pct:.1f}% above** the 200-period EMA (${ctx_val['last_ema200']}), suggesting a bullish long-term trend.\n"
-            else:
-                diff_pct = ((ctx_val["last_ema200"] - ctx_val["last_close"]) / ctx_val["last_ema200"] * 100)
-                response += f"The price is **{diff_pct:.1f}% below** the 200-period EMA (${ctx_val['last_ema200']}), indicating a bearish long-term trend.\n"
-
-    response += "\n"
-
-    # Momentum analysis
-    if ctx_val.get("last_macd") is not None and ctx_val.get("last_signal") is not None:
-        if ctx_val["last_macd"] > ctx_val["last_signal"]:
-            response += f"**MACD** ({ctx_val['last_macd']:.2f}) is above the signal line ({ctx_val['last_signal']:.2f}), showing **bullish momentum**.\n"
-        else:
-            response += f"**MACD** ({ctx_val['last_macd']:.2f}) is below the signal line ({ctx_val['last_signal']:.2f}), showing **bearish momentum**.\n"
-
-    # RSI analysis
-    if ctx_val.get("last_rsi") is not None:
-        rsi = ctx_val["last_rsi"]
-        if rsi >= 70:
-            response += f"**RSI** is at {rsi:.1f}, in **overbought territory**. This could signal a potential pullback or consolidation.\n"
-        elif rsi <= 30:
-            response += f"**RSI** is at {rsi:.1f}, in **oversold territory**. This could signal a potential bounce or reversal.\n"
-        else:
-            response += f"**RSI** is at {rsi:.1f}, in neutral territory with room to move in either direction.\n"
-
-    response += "\n"
-
-    # Volume and volatility
-    if ctx_val.get("show_vwap") and ctx_val.get("last_vwap") is not None:
-        if ctx_val["last_close"] > ctx_val["last_vwap"]:
-            response += f"Price is trading **above VWAP** (${ctx_val['last_vwap']}), suggesting buyers are in control.\n"
-        else:
-            response += f"Price is trading **below VWAP** (${ctx_val['last_vwap']}), suggesting sellers have the edge.\n"
-
-    if ctx_val.get("show_atr") and ctx_val.get("last_atr14") is not None:
-        response += f"**ATR(14)** is {ctx_val['last_atr14']:.2f}, indicating current volatility levels.\n"
-
-    # Notes from analysis
-    notes = ctx_val.get("notes", [])
-    if notes:
-        response += f"\n**Key takeaways**: {' '.join(notes)}\n"
-
-    response += "\n*Remember: This is educational analysis only, not financial advice.*"
-
-    return response
-
-
-def analyze_handler(chosen_sym: str, typed_sym: str,
-                    tf_key: str,
-                    show_ema200: bool, show_atr: bool, show_vwap: bool, show_vtvr: bool,
-                    vwap_mode_key: str, vwap_n_val: float, vtvr_use_tr_val: bool, vtvr_z_on_val: bool,
-                    ctx: Dict[str, Any]):
-    raw = (typed_sym or "").strip() or (chosen_sym or "").strip()
-    resolved = NAME_TO_TICKER.get(raw.upper(), raw.upper())
-
-    tf = TIMEFRAME_PRESETS[tf_key]
-    vwap_mode_val = VWAP_MODES[vwap_mode_key]
-    vwap_n_int = int(vwap_n_val) if vwap_n_val is not None else 20
-
-    df, _, _ = fetch_ohlcv(resolved, tf)
-    if df.empty:
-        import plotly.graph_objects as go
-        f = go.Figure()
-        f.update_layout(title=f"No data for '{raw}' (resolved: {resolved}) / {tf}", height=420)
-        ctx = {"symbol": resolved, "timeframe": tf, "ok": False}
-        insight = {
-            "Trend": "—", "Momentum": "—", "RSI": "—", "ATR": "—", "VWAP": "—", "VTVR": "—", "Notes": "No data."
-        }
-        return f, ctx, insight
-
-    dfi = compute_indicators(
-        df,
-        want_ema200=bool(show_ema200),
-        want_atr=bool(show_atr),
-        vwap_mode=vwap_mode_val,
-        vwap_n=vwap_n_int,
-        want_vtvr=bool(show_vtvr),
-        vtvr_use_tr=bool(vtvr_use_tr_val),
-        vtvr_z_on=bool(vtvr_z_on_val),
-        vtvr_z_window=60,
-        ensure_macd_rsi=True,
+# ---------- Summary builder ----------
+def _build_summary(info, ticker: str, hist):
+    return (
+        f"### {info.get('shortName', ticker)} ({ticker.upper()})\n\n"
+        f"💰 **Current Price:** {info.get('currentPrice', 'N/A')}\n"
+        f"📉 **Previous Close:** {info.get('previousClose', 'N/A')}\n\n"
+        f"🏦 **Market Cap:** {_format_number(info.get('marketCap'))}\n"
+        f"📊 **Volume:** {_format_number(info.get('volume'))}\n\n"
+        f"📈 **52W High:** {info.get('fiftyTwoWeekHigh', 'N/A')}\n"
+        f"📉 **52W Low:** {info.get('fiftyTwoWeekLow', 'N/A')}\n\n"
+        f"📊 **Indicators:**\n"
+        f"- {analyze_rsi(hist)}\n"
+        f"- {analyze_ema(hist)}\n"
+        f"- {analyze_macd(hist)}\n"
     )
 
-    fig = make_figure(
-        dfi,
-        show_ema200=bool(show_ema200),
-        show_atr=bool(show_atr),
-        show_vwap=bool(show_vwap),
-        show_vtvr=bool(show_vtvr),
-        show_vtvr_z=bool(vtvr_z_on_val and show_vtvr),
-    )
+# ---------- Interval chooser ----------
+def _choose_interval(view_choice: str, period_choice: str) -> str:
+    if period_choice in ["1y", "2y", "3y"]:
+        return "1d"
+    return VIEW_INTERVALS.get(view_choice, "1d")
 
-    snap = make_chat_snapshot(dfi)
-    ctx = {
-        "symbol": resolved,
-        "timeframe": tf,
-        "show_ema200": bool(show_ema200),
-        "show_atr": bool(show_atr),
-        "show_vwap": bool(show_vwap),
-        "show_vtvr": bool(show_vtvr),
-        "vwap_mode": vwap_mode_val,
-        "vwap_n": vwap_n_int,
-        "vtvr_use_tr": bool(vtvr_use_tr_val),
-        "vtvr_z_on": bool(vtvr_z_on_val),
-        **snap,
-        "ok": True,
-    }
+# ---------- Data fetcher ----------
+def get_stock_info(ticker: str, view_choice: str, period_choice: str,
+                   show_ma: bool, show_volume: bool):
+    interval = _choose_interval(view_choice, period_choice)
+    effective_period = period_choice or "6mo"
 
-    trend = "Up" if (snap.get("last_close") and snap.get("last_ema200") and snap["last_close"] > snap["last_ema200"]) \
-        else ("Down" if (snap.get("last_close") and snap.get("last_ema200")) else "—")
-    momentum = "Bullish" if (
-                snap.get("last_macd") is not None and snap.get("last_signal") is not None and snap["last_macd"] > snap[
-            "last_signal"]) \
-        else ("Bearish" if (snap.get("last_macd") is not None and snap.get("last_signal") is not None) else "—")
-    rsi_txt = f'{snap["last_rsi"]}' if snap.get("last_rsi") is not None else "—"
-    atr_txt = f'{snap["last_atr14"]}' if snap.get("last_atr14") is not None else "—"
-    vwap_txt = f'{snap["last_vwap"]}' if snap.get("last_vwap") is not None else "—"
-    vtvr_txt = f'{snap["last_vtvr"]}' if snap.get("last_vtvr") is not None else "—"
-    notes = " ".join(snap.get("notes", [])) or "—"
+    key = (ticker or "", view_choice, effective_period, bool(show_ma), bool(show_volume))
+    cached = _last_outputs.get(key, {"last_ts": None, "summary": "Waiting for data...",
+                                     "fig": None, "updated": "—"})
 
-    insight = {
-        "Trend": trend,
-        "Momentum": momentum,
-        "RSI": rsi_txt,
-        "ATR": atr_txt,
-        "VWAP": vwap_txt,
-        "VTVR": vtvr_txt,
-        "Notes": notes
-    }
+    if not (ticker and ticker.strip()):
+        return cached["summary"], cached["fig"], cached["updated"]
 
-    return fig, ctx, insight
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period=effective_period, interval=interval)
+        if hist is None or hist.empty:
+            return cached["summary"], cached["fig"], cached["updated"]
 
+        current_last_ts = hist.index[-1]
+        if cached["last_ts"] is not None and current_last_ts == cached["last_ts"]:
+            return gr.update(), gr.update(), cached["updated"]
 
-def build_ui():
-    # Blue theme
-    theme = gr.themes.Soft(
-        primary_hue="blue",
-        secondary_hue="blue",
-    )
+        info = stock.info
+        summary = _build_summary(info, ticker, hist)
 
-    css = """
-    .gradio-container {max-width: 1400px; margin: 0 auto;}
-    .header-bar {
-        display: flex; 
-        align-items: center; 
-        gap: 0.75rem; 
-        background: linear-gradient(to right, #ffffff, #fafafa);
-        border: 1px solid #e5e7eb;
-        border-radius: 16px; 
-        padding: 14px 20px; 
-        box-shadow: 0 2px 8px rgba(0,0,0,.06);
-        margin-bottom: 1.5rem;
-    }
-    .app-dot {
-        width: 10px;
-        height: 10px;
-        border-radius: 50%;
-        background: linear-gradient(135deg, #3b82f6, #2563eb);
-        box-shadow: 0 2px 4px rgba(59,130,246,0.3);
-    }
-    .header-title {
-        font-weight: 600;
-        font-size: 1.1rem;
-        color: #1a1a1a;
-    }
-    .header-subtitle {
-        opacity: 0.7;
-        font-weight: 400;
-    }
-    .badge {
-        font-size: 0.75rem; 
-        padding: 4px 12px; 
-        border-radius: 999px; 
-        background: #dbeafe;
-        border: 1px solid #3b82f6; 
-        color: #1e40af;
-        font-weight: 500;
-    }
-    .insight-card {
-        background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
-        border: 1px solid #bae6fd;
-        border-radius: 12px;
-        padding: 16px;
-        margin-top: 1rem;
-    }
-    .insight-card h3 {
-        font-size: 1rem;
-        font-weight: 600;
-        margin-bottom: 12px;
-        color: #0c4a6e;
-    }
-    .chat-container {
-        border: 1px solid #e5e7eb !important;
-        border-radius: 12px !important;
-        overflow: hidden !important;
-    }
-    input[type="checkbox"]:checked {
-        background-color: #3b82f6 !important;
-        border-color: #3b82f6 !important;
-    }
-    .primary {
-        background: linear-gradient(135deg, #3b82f6, #2563eb) !important;
-        border: none !important;
-    }
-    .primary:hover {
-        background: linear-gradient(135deg, #2563eb, #1d4ed8) !important;
-    }
-     .logo-box,.logo-box img {
-                    max-width: 120px !important;
-                    height: auto !important;
-                    background: transparent !important;
-            }
+        title = f"{ticker.upper()} — {view_choice} view over {effective_period} (interval={interval})"
+        fig = _build_chart(hist, show_ma, show_volume, title)
+        updated = datetime.datetime.now().strftime("Last updated: %Y-%m-%d %H:%M:%S")
 
-    """
+        _last_outputs[key] = {"last_ts": current_last_ts,
+                              "summary": summary, "fig": fig, "updated": updated}
+        return summary, fig, updated
+    except Exception:
+        return cached["summary"], cached["fig"], cached["updated"]
 
-    with gr.Blocks(title="Agentic-Stonks", theme=theme, css=css) as demo:
-        # Header with blue accent
-        with gr.Row():
-            gr.Image(
-                value="images/Agentic_Stonks.png",
-                show_label=False,
-                elem_id="logo",
-                elem_classes=["logo-box"]
-            )
-            gr.HTML("<div class='header'>"
-                    "<span>Agentic-Stonks — Explain, Advise, Interpret</span>"
-                    "<div class='subtext'>Educational use only. Not financial advice.</div>"
-                    "</div>")
+# ---------- Chatbot ----------
+def stock_chat(message, history):
+    try:
+        messages = [{"role": "system",
+                     "content": "You are a helpful financial assistant. Answer questions about stocks clearly."}]
+        for user, bot in history:
+            messages.append({"role": "user", "content": user})
+            messages.append({"role": "assistant", "content": bot})
+        messages.append({"role": "user", "content": message})
 
-        analysis_context = gr.State(value={"ok": False})
-        chat_fn.analysis_context = analysis_context
-
-        with gr.Row(equal_height=False):
-            with gr.Column(scale=7):
-                with gr.Row():
-                    choose_symbol = gr.Dropdown(
-                        label="Choose stock / symbol",
-                        choices=["AAPL", "AMZN", "MSFT", "META", "NVDA", "TSLA", "GOOGL"],
-                        value="META",
-                    )
-                    symbol_text = gr.Textbox(label="Or type symbol", placeholder="e.g., AAPL")
-                    timeframe = gr.Dropdown(
-                        choices=list(TIMEFRAME_PRESETS.keys()),
-                        value="Daily (1d)",
-                        label="Timeframe",
-                    )
-                    analyze_btn = gr.Button("Analyze", variant="primary")
-
-                with gr.Row():
-                    cb_ema200 = gr.Checkbox(True, label="EMA200")
-                    cb_atr = gr.Checkbox(True, label="ATR(14)")
-                    cb_vwap = gr.Checkbox(True, label="VWAP")
-                    cb_vtvr = gr.Checkbox(True, label="VTVR")
-
-                with gr.Accordion("⚙️ Settings", open=False):
-                    with gr.Row():
-                        vwap_mode = gr.Dropdown(choices=list(VWAP_MODES.keys()), value="Session (intraday reset)",
-                                                label="VWAP mode")
-                        vwap_n = gr.Slider(5, 120, value=20, step=1, label="VWAP window (rolling)")
-                    with gr.Row():
-                        vtvr_use_tr = gr.Checkbox(False, label="VTVR: use TrueRange instead of ATR(14)")
-                        vtvr_z_on = gr.Checkbox(True, label="VTVR z-score overlay")
-
-                fig_out = gr.Plot(label="Chart")
-
-                # Insight Card with blue theme
-                with gr.Group(elem_classes=["insight-card"]):
-                    gr.HTML("<h3>📊 Insight Card</h3>")
-                    with gr.Row():
-                        insight_trend = gr.Textbox(value="—", label="Trend", interactive=False, scale=1)
-                        insight_momo = gr.Textbox(value="—", label="Momentum", interactive=False, scale=1)
-                        insight_rsi = gr.Textbox(value="—", label="RSI", interactive=False, scale=1)
-                    with gr.Row():
-                        insight_atr = gr.Textbox(value="—", label="ATR", interactive=False, scale=1)
-                        insight_vwap = gr.Textbox(value="—", label="VWAP", interactive=False, scale=1)
-                        insight_vtvr = gr.Textbox(value="—", label="VTVR", interactive=False, scale=1)
-                    insight_notes = gr.Textbox(value="—", label="Notes", interactive=False, lines=2)
-
-            with gr.Column(scale=5):
-                gr.Markdown("### 💬 Ask the AI about the chart")
-                gr.Markdown("*Get insights on trends, indicators, and market conditions*")
-
-                # *** FIXED: Proper chatbot with messages type ***
-                chatbot = gr.Chatbot(
-                    value=[],
-                    height=450,
-                    elem_classes=["chat-container"],
-                    show_label=False,
-                    type="messages"
-                )
-
-                # Combined input area
-                with gr.Row():
-                    chat_input = gr.Textbox(
-                        placeholder="Ask about RSI, MACD, trend direction, support levels...",
-                        show_label=False,
-                        scale=9,
-                        lines=1,
-                        container=False
-                    )
-                    send_btn = gr.Button("Send", variant="primary", scale=1, size="sm")
-
-                with gr.Row():
-                    clear_btn = gr.ClearButton([chatbot], value="Clear Chat", size="sm")
-                    gr.Markdown("*Powered by market data analysis*", elem_classes=["text-xs"])
-
-                # *** FIXED: Proper message handling ***
-                def submit_message(msg, history):
-                    if not msg.strip():
-                        return "", history
-                    return "", chat_fn(msg, history)
-
-                send_btn.click(
-                    fn=submit_message,
-                    inputs=[chat_input, chatbot],
-                    outputs=[chat_input, chatbot],
-                )
-
-                chat_input.submit(
-                    fn=submit_message,
-                    inputs=[chat_input, chatbot],
-                    outputs=[chat_input, chatbot],
-                )
-
-        # Insight state management
-        insight_state = gr.State({})
-
-        def _insight_to_outputs(d: Dict[str, str]):
-            d = d or {}
-            return (
-                d.get("Trend", "—"),
-                d.get("Momentum", "—"),
-                d.get("RSI", "—"),
-                d.get("ATR", "—"),
-                d.get("VWAP", "—"),
-                d.get("VTVR", "—"),
-                d.get("Notes", "—"),
-            )
-
-        analyze_btn.click(
-            analyze_handler,
-            inputs=[choose_symbol, symbol_text,
-                    timeframe,
-                    cb_ema200, cb_atr, cb_vwap, cb_vtvr,
-                    vwap_mode, vwap_n, vtvr_use_tr, vtvr_z_on,
-                    analysis_context],
-            outputs=[fig_out, analysis_context, insight_state],
-        ).then(
-            fn=_insight_to_outputs,
-            inputs=insight_state,
-            outputs=[insight_trend, insight_momo, insight_rsi, insight_atr, insight_vwap, insight_vtvr, insight_notes]
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages
         )
+        return resp.choices[0].message.content
+    except Exception as e:
+        return f"Error: {str(e)}"
 
+# ---------- UI Builder ----------
+def build_ui():
+    with gr.Blocks(title="AgenticStonks Dashboard") as demo:
+        gr.Markdown("# 📈 AgenticStonks Dashboard")
+
+        with gr.Row():
+            # LEFT: Stock Viewer + Indicators
+            with gr.Column(scale=2):
+                with gr.Row():
+                    ticker_dropdown = gr.Dropdown(
+                        label="Select Stock Symbol (Quick Picks)",
+                        choices=["AAPL", "TSLA", "MSFT", "AMZN", "GOOG", "META", "NVDA"],
+                        value="AAPL"
+                    )
+                    ticker_textbox = gr.Textbox(
+                        label="Or type your own ticker",
+                        placeholder="e.g. AMD, SPY, NFLX",
+                        value="",
+                    )
+
+                view_choice = gr.Radio(label="View Type", choices=["Daily", "Weekly"], value="Daily")
+                period_choice = gr.Radio(label="Time Frame", choices=ALLOWED_PERIODS, value="6mo")
+                show_ma = gr.Checkbox(label="Show MA-20 / MA-50", value=True)
+                show_volume = gr.Checkbox(label="Show Volume Bars", value=True)
+
+                # preload
+                default_summary, default_chart, default_updated = get_stock_info("AAPL", "Daily", "6mo", True, True)
+                stock_output = gr.Markdown(value=default_summary)
+                stock_chart = gr.Plot(value=default_chart)
+                last_updated = gr.Markdown(value=default_updated)
+
+                def _inputs_for(fn):
+                    return dict(
+                        fn=fn,
+                        inputs=[ticker_dropdown, view_choice, period_choice, show_ma, show_volume],
+                        outputs=[stock_output, stock_chart, last_updated]
+                    )
+
+                ticker_dropdown.change(**_inputs_for(get_stock_info))
+                ticker_textbox.change(
+                    fn=lambda text_val, *rest: get_stock_info(
+                        text_val.strip().upper() if text_val.strip() else ticker_dropdown.value, *rest
+                    ),
+                    inputs=[ticker_textbox, view_choice, period_choice, show_ma, show_volume],
+                    outputs=[stock_output, stock_chart, last_updated]
+                )
+                view_choice.change(**_inputs_for(get_stock_info))
+                period_choice.change(**_inputs_for(get_stock_info))
+                show_ma.change(**_inputs_for(get_stock_info))
+                show_volume.change(**_inputs_for(get_stock_info))
+
+                gr.Timer(30.0).tick(
+                    fn=lambda *a: get_stock_info(*a),
+                    inputs=[ticker_dropdown, ticker_textbox, view_choice, period_choice, show_ma, show_volume],
+                    outputs=[stock_output, stock_chart, last_updated]
+                )
+
+            # RIGHT: Chatbox
+            with gr.Column(scale=1):
+                gr.ChatInterface(
+                    fn=stock_chat,
+                    type="messages",
+                    title="💬 Stonk Assistant",
+                    description="Ask me questions about stocks while watching the chart!"
+                )
     return demo
 
-
+# ---------- Entry Point ----------
 if __name__ == "__main__":
     demo = build_ui()
-    demo.launch()
+    demo.launch(server_name="127.0.0.1", server_port=7860)
