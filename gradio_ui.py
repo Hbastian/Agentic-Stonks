@@ -1,4 +1,25 @@
 # gradio_ui.py
+# ============================================================
+# Gradio UI Layer for Agentic-Stonks
+# ============================================================
+# Responsibilities:
+# - Defines the full Gradio user interface (charts + chat)
+# - Routes user inputs into the analysis pipeline
+# - Handles:
+#       • Symbol resolution
+#       • Timeframes + indicator toggles
+#       • Data fetch + indicator computation
+#       • Plot creation
+#       • Insight summary card
+#       • Integrated AI chat (OpenAI optional)
+#
+# The UI exposes:
+#   - Chart visualization
+#   - Insight card with trend/momentum/RSI/VWAP/etc.
+#   - Conversational chat assistant referencing chart context
+#
+# ============================================================
+
 from __future__ import annotations
 import os
 from typing import Dict, Any, List, Tuple
@@ -10,24 +31,37 @@ load_dotenv()
 import gradio as gr
 from analysis import fetch_ohlcv, compute_indicators, make_figure, make_chat_snapshot
 
+# ============================================================
+# Constants & Lookup Tables
+# ============================================================
+
+# Timeframe presets → human-friendly names
 TIMEFRAME_PRESETS = {
     "Hourly (1h)": "1h",
     "4 Hours (4h)": "4h",
     "Daily (1d)": "1d",
 }
 
+# VWAP computation modes
 VWAP_MODES = {
     "Session (intraday reset)": "session",
     "Rolling Window": "rolling",
     "Anchored* (uses rolling fallback)": "anchored",
 }
 
+# Ticker alias mapping
 NAME_TO_TICKER = {
     "APPLE": "AAPL", "AMAZON": "AMZN", "MICROSOFT": "MSFT", "META": "META",
     "ALPHABET": "GOOGL", "GOOGLE": "GOOGL", "TESLA": "TSLA", "NVIDIA": "NVDA"
 }
 
-# OpenAI (optional)
+# ============================================================
+# Optional OpenAI Chat Client Setup
+# ============================================================
+# - Allows providing deeper indicator explanations
+# - If no API key is set, uses fallback rule-based responses
+# ============================================================
+
 try:
     from openai import OpenAI
 
@@ -41,6 +75,8 @@ except Exception:
     _OPENAI_OK = False
     _client = None
 
+
+# System instruction given to OpenAI models
 _SYSTEM_PROMPT = (
     "You are a helpful stock-analysis assistant embedded in a charting app. "
     "Provide conversational, insightful responses that explain technical indicators clearly. "
@@ -49,6 +85,12 @@ _SYSTEM_PROMPT = (
     "Educational use only - avoid giving direct buy/sell recommendations."
 )
 
+# ============================================================
+# Context Formatting for Chat Model
+# ============================================================
+# Converts the analysis snapshot into a human-readable
+# text block. Used as supplemental context for the LLM.
+# ============================================================
 
 def _context_to_text(ctx: Dict[str, Any]) -> str:
     if not isinstance(ctx, dict) or not ctx.get("ok"):
@@ -64,6 +106,7 @@ def _context_to_text(ctx: Dict[str, Any]) -> str:
         f"{'VTVR ' if ctx.get('show_vtvr') else ''}".strip(),
     ]
 
+    # Add latest values
     values_section = []
     if ctx.get("last_close") is not None:
         values_section.append(f"Last Close: ${ctx['last_close']}")
@@ -83,6 +126,7 @@ def _context_to_text(ctx: Dict[str, Any]) -> str:
             vtvr_str += f" (z-score: {ctx['last_vtvr_z']})"
         values_section.append(vtvr_str)
 
+
     if values_section:
         lines.append("\nCurrent Values:")
         lines.extend(values_section)
@@ -93,8 +137,16 @@ def _context_to_text(ctx: Dict[str, Any]) -> str:
 
     return "\n".join(lines)
 
+# ============================================================
+# Chat Function Logic for Gradio
+# ============================================================
+# chat_fn():
+# - Handles both user messages and system responses
+# - Supports OpenAI if available
+# - Otherwise uses rule-based fallback analysis
+# - Must return proper Gradio "messages" format
+# ============================================================
 
-# *** FIXED: Changed to return proper message format for Gradio ***
 def chat_fn(message: str, history: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """Handle chat with proper dictionary format for Gradio Chatbot with type='messages'"""
     ctx_state = getattr(chat_fn, "analysis_context", None)
@@ -132,6 +184,14 @@ def chat_fn(message: str, history: List[Dict[str, str]]) -> List[Dict[str, str]]
     ]
     return new_history
 
+
+# ============================================================
+# Fallback Response Generation
+# ============================================================
+# Used when OpenAI is unavailable. Produces a structured,
+# indicator-aware explanation of price, trend, RSI, MACD,
+# VWAP, ATR, and overall chart conditions.
+# ============================================================
 
 def _generate_fallback_response(ctx_val: Dict[str, Any]) -> str:
     """Generate intelligent fallback response when OpenAI is unavailable"""
@@ -195,6 +255,24 @@ def _generate_fallback_response(ctx_val: Dict[str, Any]) -> str:
 
     return response
 
+# ============================================================
+# analyze_handler()
+# ============================================================
+# CENTRAL DATA PIPELINE
+# ---------------------
+# Steps:
+#   1. Resolve symbol input (typed or dropdown)
+#   2. Fetch OHLCV data
+#   3. Compute EMA/VWAP/ATR/VTVR/MACD/RSI
+#   4. Build Plotly chart
+#   5. Build analysis context state
+#   6. Build Insight Card (Trend, Momentum, RSI, ATR, VWAP, VTVR)
+#
+# Returns (for Gradio):
+#   - figure
+#   - context dict
+#   - insight dict
+# ============================================================
 
 def analyze_handler(chosen_sym: str, typed_sym: str,
                     tf_key: str,
@@ -281,6 +359,23 @@ def analyze_handler(chosen_sym: str, typed_sym: str,
 
     return fig, ctx, insight
 
+# ============================================================
+# build_ui()
+# ============================================================
+# The MAIN UI definition.
+#
+# Creates:
+#   - Header + logo
+#   - Symbol input + timeframe selector
+#   - Indicator toggle panel
+#   - Chart display (Plotly)
+#   - Insight Card
+#   - AI Chat Section
+#   - Settings accordions
+#
+# Returns:
+#   A fully configured Gradio Blocks() app.
+# ============================================================
 
 def build_ui():
     # Blue theme
