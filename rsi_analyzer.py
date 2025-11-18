@@ -1,4 +1,3 @@
-# simple_stock_advisor.py
 # =============================================================
 # SIMPLE STOCK ADVISOR — Educational RSI-Based Stock Checker
 # =============================================================

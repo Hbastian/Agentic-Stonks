@@ -1,4 +1,9 @@
-# app.py
+from flask import Flask, jsonify
+import threading
+import os
+import atexit
+from gradio_ui import build_ui
+
 # ------------------------------------------------------------
 # Flask + Gradio dual-server project
 # ------------------------------------------------------------
@@ -10,11 +15,6 @@
 # - On shutdown, Gradio is cleanly closed with atexit hooks
 # ------------------------------------------------------------
 
-from flask import Flask, jsonify
-import threading
-import os
-import atexit
-from gradio_ui import build_ui
 
 # ------------------------------------------------------------
 # Flask App Creation

@@ -1,6 +1,3 @@
-# analysis.py
-# Data fetch, indicator calculations, chart construction, and a compact summary for chat.
-
 from __future__ import annotations
 import numpy as np
 import pandas as pd
@@ -8,7 +5,7 @@ import yfinance as yf
 from typing import Literal, Tuple, Dict, Any
 
 # ==========================================================
-# ===============             DATA             ==============
+# ===============             DATA             =============
 # ==========================================================
 
 # ----------------------------------------------------------
