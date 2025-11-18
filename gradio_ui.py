@@ -365,7 +365,7 @@ def build_ui():
     """
 
     with gr.Blocks(title="Agentic-Stonks", theme=theme, css=css) as demo:
-        # Header with blue accent
+
         with gr.Row():
             gr.Image(
                 value="images/Agentic_Stonks.png",
