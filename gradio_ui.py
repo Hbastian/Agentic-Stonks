@@ -5,7 +5,10 @@ from typing import Dict, Any, List, Tuple
 
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)  # Force override if already loaded
+
+import os
+api_key = os.getenv("OPENAI_API_KEY", "").strip()
 
 import gradio as gr
 from analysis import fetch_ohlcv, compute_indicators, make_figure, make_chat_snapshot
@@ -31,15 +34,19 @@ NAME_TO_TICKER = {
 try:
     from openai import OpenAI
 
-    if os.getenv("OPENAI_API_KEY"):
-        _client = OpenAI()
+    api_key = os.getenv("OPENAI_API_KEY")
+    if api_key:
+        _client = OpenAI(api_key=api_key)
         _OPENAI_OK = True
     else:
-        _OPENAI_OK = False
         _client = None
+        _OPENAI_OK = False
+
 except Exception:
     _OPENAI_OK = False
     _client = None
+
+print("🔍 OpenAI configured:", _OPENAI_OK, "API key present:", bool(os.getenv("OPENAI_API_KEY")))
 
 _SYSTEM_PROMPT = (
     "You are a helpful stock-analysis assistant embedded in a charting app. "
@@ -47,6 +54,8 @@ _SYSTEM_PROMPT = (
     "Use the provided context (symbol, timeframe, toggles, last values) to give specific, actionable insights. "
     "Be concise but thorough. Explain what the indicators suggest about the current market conditions. "
     "Educational use only - avoid giving direct buy/sell recommendations."
+    "Keep responses concise and contextual. Do not repeat prior analysis unless the user requests a full breakdown again."
+
 )
 
 
@@ -95,42 +104,56 @@ def _context_to_text(ctx: Dict[str, Any]) -> str:
 
 
 # *** FIXED: Changed to return proper message format for Gradio ***
-def chat_fn(message: str, history: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """Handle chat with proper dictionary format for Gradio Chatbot with type='messages'"""
-    ctx_state = getattr(chat_fn, "analysis_context", None)
-    ctx_val = ctx_state.value if isinstance(ctx_state, gr.State) else (ctx_state or {})
+def chat_fn(message: str,
+            history: List[Dict[str, str]],
+            ctx_val: Dict[str, Any],
+            memory: List[Dict[str, str]]) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+
+    ctx_val = ctx_val or {}
     ctx_text = _context_to_text(ctx_val)
 
+    # --- BUILD FULL CHAT HISTORY WITH MEMORY ---
+    messages = [{"role": "system", "content": _SYSTEM_PROMPT + "\n\n" + ctx_text}]
+
+    # Include persistent memory (not just UI display)
+    for m in memory:
+        messages.append(m)
+
+    # Include visible history to keep UI and memory aligned
+    for msg in history:
+        role = msg.get("role")
+        if role == "ai":
+            role = "assistant"
+        elif role == "human":
+            role = "user"
+        messages.append({"role": role, "content": msg.get("content", "")})
+
+    # Add new user message
+    messages.append({"role": "user", "content": message})
+
+    # --- CALL OPENAI ---
     if _OPENAI_OK:
-        try:
-            messages = [{"role": "system", "content": _SYSTEM_PROMPT + "\n\n" + ctx_text}]
-
-            # Convert history to OpenAI format
-            for msg in history:
-                if isinstance(msg, dict):
-                    messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
-
-            messages.append({"role": "user", "content": str(message)})
-
-            resp = _client.chat.completions.create(
-                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-                messages=messages,
-                temperature=0.3,
-                max_tokens=800,
-            )
-            response_text = resp.choices[0].message.content.strip()
-
-        except Exception as e:
-            response_text = f"I'm having trouble connecting to the AI service. Let me give you what I can see from the chart data.\n\n{_generate_fallback_response(ctx_val)}"
+        # GPT-5+ uses max_completion_tokens instead of max_tokens
+        resp = _client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-5.1"),
+            messages=messages,
+            max_completion_tokens=700,
+        )
+        response_text = resp.choices[0].message.content.strip()
     else:
         response_text = _generate_fallback_response(ctx_val)
 
-    # *** FIXED: Return proper message format ***
+    # --- UPDATE MEMORY ---
+    memory.append({"role": "user", "content": message})
+    memory.append({"role": "assistant", "content": response_text})
+
+    # --- UPDATE UI HISTORY ---
     new_history = history + [
         {"role": "user", "content": message},
-        {"role": "assistant", "content": response_text}
+        {"role": "assistant", "content": response_text},
     ]
-    return new_history
+
+    return new_history, memory
 
 
 def _generate_fallback_response(ctx_val: Dict[str, Any]) -> str:
@@ -379,7 +402,7 @@ def build_ui():
                     "</div>")
 
         analysis_context = gr.State(value={"ok": False})
-        chat_fn.analysis_context = analysis_context
+        conversation_state = gr.State(value=[])
 
         with gr.Row(equal_height=False):
             with gr.Column(scale=7):
@@ -452,25 +475,27 @@ def build_ui():
                     send_btn = gr.Button("Send", variant="primary", scale=1, size="sm")
 
                 with gr.Row():
-                    clear_btn = gr.ClearButton([chatbot], value="Clear Chat", size="sm")
+                    clear_btn = gr.ClearButton([chatbot, conversation_state], value="Clear Chat", size="sm")
+
                     gr.Markdown("*Powered by market data analysis*", elem_classes=["text-xs"])
 
                 # *** FIXED: Proper message handling ***
-                def submit_message(msg, history):
+                def submit_message(msg, history, ctx_val, memory):
                     if not msg.strip():
-                        return "", history
-                    return "", chat_fn(msg, history)
+                        return "", history, memory
+                    new_history, new_memory = chat_fn(msg, history, ctx_val, memory)
+                    return "", new_history, new_memory
 
                 send_btn.click(
                     fn=submit_message,
-                    inputs=[chat_input, chatbot],
-                    outputs=[chat_input, chatbot],
+                    inputs=[chat_input, chatbot, analysis_context, conversation_state],
+                    outputs=[chat_input, chatbot, conversation_state],
                 )
 
                 chat_input.submit(
                     fn=submit_message,
-                    inputs=[chat_input, chatbot],
-                    outputs=[chat_input, chatbot],
+                    inputs=[chat_input, chatbot, analysis_context, conversation_state],
+                    outputs=[chat_input, chatbot, conversation_state],
                 )
 
         # Insight state management
